@@ -9,21 +9,26 @@ use std::sync::Mutex;
 
 use crowd_pilot_serializer_core::{
     ConversationMessage as CoreMessage, ConversationStateManager as CoreManager,
-    ConversationStateManagerConfig, Tokenizer,
+    ConversationStateManagerConfig, Role, Tokenizer,
 };
 
 /// A message in the conversation.
 #[napi(object)]
 pub struct ConversationMessage {
-    pub from: String,
-    pub value: String,
+    pub role: String,
+    pub content: String,
 }
 
 impl From<CoreMessage> for ConversationMessage {
     fn from(msg: CoreMessage) -> Self {
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
         Self {
-            from: msg.from,
-            value: msg.value,
+            role: role.to_string(),
+            content: msg.content,
         }
     }
 }

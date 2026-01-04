@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Serialize, Serializer};
+
 use crate::diff::compute_changed_block_lines;
 use crate::helpers::{
     clean_text, escape_single_quotes_for_sed, fenced_block, floor_char_boundary,
@@ -10,25 +12,43 @@ use crate::helpers::{
 use crate::Tokenizer;
 use crate::{COALESCE_RADIUS, MAX_TOKENS_PER_MESSAGE, MAX_TOKENS_PER_TERMINAL_OUTPUT, VIEWPORT_RADIUS};
 
+/// Role in a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+impl Serialize for Role {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Role::System => serializer.serialize_str("system"),
+            Role::User => serializer.serialize_str("user"),
+            Role::Assistant => serializer.serialize_str("assistant"),
+        }
+    }
+}
+
 /// A single message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationMessage {
-    pub from: String,
-    pub value: String,
+    pub role: Role,
+    pub content: String,
 }
 
 impl ConversationMessage {
-    pub fn user(value: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<String>) -> Self {
         Self {
-            from: "User".to_string(),
-            value: value.into(),
+            role: Role::User,
+            content: content.into(),
         }
     }
 
-    pub fn assistant(value: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            from: "Assistant".to_string(),
-            value: value.into(),
+            role: Role::Assistant,
+            content: content.into(),
         }
     }
 }
@@ -141,8 +161,8 @@ where
 
         // Check if conversation meets minimum requirements
         let is_long_enough = self.messages.len() >= self.config.min_conversation_messages;
-        let has_user = self.messages.iter().any(|m| m.from == "User");
-        let has_assistant = self.messages.iter().any(|m| m.from == "Assistant");
+        let has_user = self.messages.iter().any(|m| m.role == Role::User);
+        let has_assistant = self.messages.iter().any(|m| m.role == Role::Assistant);
 
         if is_long_enough && has_user && has_assistant {
             self.finalized_conversations.push(FinalizedConversation {
@@ -182,11 +202,11 @@ where
     /// If chunking is enabled and conversation limit would be exceeded,
     /// finalizes current conversation and starts a new one.
     fn append_message(&mut self, mut message: ConversationMessage) {
-        let mut tokens = self.tokenizer.count_tokens(&message.value);
+        let mut tokens = self.tokenizer.count_tokens(&message.content);
         
         if tokens > self.config.max_tokens_per_message {
-            message.value = self.tokenizer.truncate_to_max_tokens(
-                &message.value,
+            message.content = self.tokenizer.truncate_to_max_tokens(
+                &message.content,
                 self.config.max_tokens_per_message,
             );
             tokens = self.config.max_tokens_per_message;
@@ -602,10 +622,10 @@ mod tests {
 
         let messages = manager.finalize_for_model();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].from, "Assistant");
-        assert!(messages[0].value.contains("cat -n /test/file.rs"));
-        assert_eq!(messages[1].from, "User");
-        assert!(messages[1].value.contains("<stdout>"));
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert!(messages[0].content.contains("cat -n /test/file.rs"));
+        assert_eq!(messages[1].role, Role::User);
+        assert!(messages[1].content.contains("<stdout>"));
     }
 
     #[test]
@@ -632,8 +652,8 @@ mod tests {
 
         let messages = manager.finalize_for_model();
         assert_eq!(messages.len(), 2);
-        assert!(messages[0].value.contains("cargo build"));
-        assert!(messages[1].value.contains("Compiling"));
+        assert!(messages[0].content.contains("cargo build"));
+        assert!(messages[1].content.contains("Compiling"));
     }
 }
 

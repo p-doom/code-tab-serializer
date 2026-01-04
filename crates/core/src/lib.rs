@@ -34,10 +34,10 @@ mod diff;
 mod helpers;
 pub mod pipeline;
 
-pub use conversation::{ConversationMessage, ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation};
+pub use conversation::{ConversationMessage, ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
 pub use pipeline::{
     discover_csv_files, process_all_sessions, process_session, write_jsonl_output,
-    NemoMessage, NemoRecord, PipelineConfig, PipelineResult, SessionResult,
+    MilesMessage, MilesRecord, PipelineConfig, PipelineResult, SessionResult,
 };
 pub use diff::{compute_changed_block_lines, ChangedBlock};
 pub use helpers::{
