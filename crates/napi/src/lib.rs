@@ -243,3 +243,14 @@ pub fn line_numbered_output(
         end_line.map(|v| v as usize),
     )
 }
+
+/// Get the default system prompt for the model.
+///
+/// This returns the same system prompt used during preprocessing, ensuring
+/// consistency between training and deployment.
+///
+/// @param viewportRadius - Viewport radius (lines above/below cursor).
+#[napi]
+pub fn get_default_system_prompt(viewport_radius: u32) -> String {
+    crowd_pilot_serializer_core::default_system_prompt(viewport_radius as usize)
+}

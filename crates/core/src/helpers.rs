@@ -180,10 +180,14 @@ pub fn serialize_compute_viewport(total_lines: usize, center_line: usize, radius
     Viewport { start, end }
 }
 
-/// Escape single quotes for use in sed commands.
+/// Escape special characters for use in sed replacement text.
+///
+/// Escapes backslashes (doubled) and single quotes (shell quote-switching technique).
 pub fn escape_single_quotes_for_sed(text: &str) -> String {
-    // Close quote, add an escaped single quote, reopen quote: '"'"'
-    text.replace('\'', "'\"'\"'")
+    // 1. Escape backslashes first: \ -> \\
+    // 2. Escape single quotes: ' -> '"'"' (close quote, add escaped quote via double quotes, reopen)
+    text.replace('\\', "\\\\")
+        .replace('\'', "'\"'\"'")
 }
 
 #[cfg(test)]

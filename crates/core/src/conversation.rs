@@ -278,7 +278,7 @@ where
                 .iter()
                 .map(|line| escape_single_quotes_for_sed(line))
                 .collect();
-            let sed_payload = escaped_lines.join("\n");
+            let sed_payload = escaped_lines.join("\\\n");
             if changed.start_before <= before_total_lines.max(1) {
                 sed_cmd = format!(
                     "sed -i '{}i\\\n{}' {}",
@@ -300,7 +300,7 @@ where
                 .iter()
                 .map(|line| escape_single_quotes_for_sed(line))
                 .collect();
-            let sed_payload = escaped_lines.join("\n");
+            let sed_payload = escaped_lines.join("\\\n");
             sed_cmd = format!(
                 "sed -i '{},{}c\\\n{}' {}",
                 changed.start_before, changed.end_before, sed_payload, target_file

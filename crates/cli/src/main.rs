@@ -10,6 +10,7 @@ use clap::Parser;
 use tokenizers::Tokenizer as HfTokenizer;
 
 use crowd_pilot_serializer_core::{
+    default_system_prompt,
     pipeline::{PipelineConfig, PipelineResult},
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
@@ -59,19 +60,6 @@ struct Args {
     #[arg(long)]
     system_prompt: Option<String>,
 }
-
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.
-Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
-
-Format your response as shown in <format_example>.
-
-<format_example>
-```bash
-your_command_here
-```
-</format_example>
-
-Failure to follow these rules will cause your response to be rejected."#;
 
 /// Wrapper around HuggingFace tokenizers for token counting and truncation.
 ///
@@ -141,7 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_sessions = session_results.len();
     println!("Processed {} sessions", total_sessions);
 
-    let system_prompt = args.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    let default_prompt = default_system_prompt(args.viewport_radius);
+    let system_prompt = args.system_prompt.as_deref().unwrap_or(&default_prompt);
 
     println!("Writing output to {:?}...", args.output_dir);
     let result: PipelineResult = write_jsonl_output(
