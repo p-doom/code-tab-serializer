@@ -76,7 +76,7 @@ crowd-pilot-serialize \
     --val-ratio 0.1
 ```
 
-This reads CSV session files, processes them through the Rust serializer, and outputs `training.jsonl` and `validation.jsonl` in NeMo's conversation format.
+This reads CSV session files, processes them through the Rust serializer, and outputs `training.jsonl` and `validation.jsonl` in Miles' conversation format.
 
 #### CLI Options
 

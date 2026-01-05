@@ -1,7 +1,7 @@
 //! CLI tool for serializing crowd-pilot IDE interaction data.
 //!
 //! This tool processes CSV session files and outputs JSONL format suitable for
-//! NeMo SFT training. It uses the HuggingFace tokenizers Rust library for
+//! Miles SFT training. It uses the HuggingFace tokenizers Rust library for
 //! accurate token counting.
 
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use crowd_pilot_serializer_core::{
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
 
-/// Serialize crowd-pilot CSV sessions to NeMo JSONL format.
+/// Serialize crowd-pilot CSV sessions to Miles JSONL format.
 #[derive(Parser, Debug)]
 #[command(name = "crowd-pilot-serialize")]
 #[command(author, version, about, long_about = None)]

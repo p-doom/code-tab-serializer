@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::conversation::{ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation};
+use crate::conversation::{ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
 use crate::Tokenizer;
 
 /// A row from the CSV file.
@@ -70,19 +70,17 @@ pub struct PipelineResult {
     pub total_tokens: usize,
 }
 
-/// NeMo conversation record format.
+/// Miles conversation record format.
 #[derive(Debug, Serialize)]
-pub struct NemoRecord {
-    pub mask: String,
-    pub system: String,
-    pub conversations: Vec<NemoMessage>,
+pub struct MilesRecord {
+    pub messages: Vec<MilesMessage>,
 }
 
-/// A message in NeMo format.
+/// A message in Miles format.
 #[derive(Debug, Serialize)]
-pub struct NemoMessage {
-    pub from: String,
-    pub value: String,
+pub struct MilesMessage {
+    pub role: Role,
+    pub content: String,
 }
 
 /// Discover all CSV files in a directory.
@@ -264,21 +262,17 @@ pub fn write_jsonl_output(
         let is_validation = idx >= train_count;
         
         for conv in session.conversations {
-            let nemo_messages: Vec<NemoMessage> = conv
-                .messages
-                .iter()
-                .map(|m| NemoMessage {
-                    from: m.from.clone(),
-                    value: m.value.clone(),
-                })
-                .collect();
+            let mut messages = vec![MilesMessage {
+                role: Role::System,
+                content: system_prompt.to_string(),
+            }];
+            
+            messages.extend(conv.messages.iter().map(|m| MilesMessage {
+                role: m.role,
+                content: m.content.clone(),
+            }));
 
-            let record = NemoRecord {
-                mask: "User".to_string(),
-                system: system_prompt.to_string(),
-                conversations: nemo_messages,
-            };
-
+            let record = MilesRecord { messages };
             let json_line = serde_json::to_string(&record)?;
             
             if is_validation {
