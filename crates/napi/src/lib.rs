@@ -88,6 +88,11 @@ impl ConversationStateManager {
                 // Extension-specific: no chunking (single ongoing conversation)
                 max_tokens_per_conversation: None,
                 min_conversation_messages: defaults.min_conversation_messages,
+                // Extension doesn't need chat template counting
+                system_prompt: None,
+                special_tokens_per_user_message: 0,
+                special_tokens_per_assistant_message: 0,
+                conversation_start_tokens: 0,
             },
             None => ConversationStateManagerConfig {
                 // Extension-specific: no chunking

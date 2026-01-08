@@ -15,6 +15,19 @@ use crowd_pilot_serializer_core::{
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
 
+/// Special token counts for known chat templates: (user/system, assistant, conversation_start)
+fn chat_template_overhead(name: &str) -> Option<(usize, usize, usize)> {
+    match name.to_lowercase().as_str() {
+        // Qwen3: <|im_start|>role\ncontent<|im_end|> per message
+        // Assistant messages get extra <think> block (4 tokens)
+        "qwen3" => Some((5, 9, 0)),
+        // GLM-4.5: [gMASK]<sop> at start (2 tokens), then <|role|>\n per message (2 tokens)
+        // Assistant messages get extra <think></think>\n (3 tokens)
+        "glm45" => Some((2, 5, 2)),
+        _ => None,
+    }
+}
+
 /// Serialize crowd-pilot CSV sessions to Miles JSONL format.
 #[derive(Parser, Debug)]
 #[command(name = "crowd-pilot-serialize")]
@@ -31,6 +44,11 @@ struct Args {
     /// HuggingFace tokenizer model name or path
     #[arg(long)]
     tokenizer: String,
+
+    /// Chat template format for accurate token counting (required).
+    /// Supported: qwen3, glm45
+    #[arg(long)]
+    chat_template: String,
 
     /// Maximum tokens per conversation chunk
     #[arg(long, default_value = "8192")]
@@ -74,6 +92,7 @@ impl RustTokenizer {
     fn load(model_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let inner = HfTokenizer::from_pretrained(model_name, None)
             .map_err(|e| e as Box<dyn std::error::Error>)?;
+        
         Ok(Self { inner })
     }
 }
@@ -97,18 +116,34 @@ impl Tokenizer for RustTokenizer {
             return text.to_string();
         }
         
-        let truncated_ids: Vec<u32> = ids[..max_tokens].to_vec();
-        self.inner
-            .decode(&truncated_ids, true)
-            .expect("Failed to decode truncated tokens")
+        // Use offsets to slice original string precisely
+        let offsets = encoding.get_offsets();
+        let (_, end) = offsets[max_tokens - 1];
+        text[..end].to_string()
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    let (special_tokens_per_user, special_tokens_per_assistant, conversation_start_tokens) =
+        chat_template_overhead(&args.chat_template).ok_or_else(|| {
+            format!(
+                "Unknown chat template: '{}'. Supported: qwen3, glm45",
+                args.chat_template
+            )
+        })?;
+
     println!("Loading tokenizer from {}...", args.tokenizer);
     let tokenizer = RustTokenizer::load(&args.tokenizer)?;
+
+    println!("  Chat template: {}", args.chat_template);
+    println!("  Per user/system message overhead: {} tokens", special_tokens_per_user);
+    println!("  Per assistant message overhead: {} tokens", special_tokens_per_assistant);
+    println!("  Conversation start overhead: {} tokens", conversation_start_tokens);
+
+    let default_prompt = default_system_prompt(args.viewport_radius);
+    let system_prompt = args.system_prompt.clone().unwrap_or(default_prompt.clone());
 
     let config = PipelineConfig {
         max_tokens_per_conversation: args.max_tokens_per_conversation,
@@ -117,6 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport_radius: args.viewport_radius,
         coalesce_radius: args.coalesce_radius,
         val_ratio: args.val_ratio,
+        system_prompt: Some(system_prompt.clone()),
+        special_tokens_per_user_message: special_tokens_per_user,
+        special_tokens_per_assistant_message: special_tokens_per_assistant,
+        conversation_start_tokens,
     };
 
     println!("Processing CSV files from {:?}...", args.csv_root);
@@ -129,15 +168,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_sessions = session_results.len();
     println!("Processed {} sessions", total_sessions);
 
-    let default_prompt = default_system_prompt(args.viewport_radius);
-    let system_prompt = args.system_prompt.as_deref().unwrap_or(&default_prompt);
-
     println!("Writing output to {:?}...", args.output_dir);
     let result: PipelineResult = write_jsonl_output(
         session_results,
         &args.output_dir,
         args.val_ratio,
-        system_prompt,
+        &system_prompt,
     )?;
 
     let metadata_path = args.output_dir.join("metadata.json");

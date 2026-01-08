@@ -64,6 +64,15 @@ pub struct ConversationStateManagerConfig {
     pub max_tokens_per_conversation: Option<usize>,
     /// Minimum messages required to keep a conversation chunk.
     pub min_conversation_messages: usize,
+    /// System prompt to include when counting conversation tokens.
+    /// This ensures accurate token limits that account for the system prompt.
+    pub system_prompt: Option<String>,
+    /// Special tokens added per user/system message by the chat template.
+    pub special_tokens_per_user_message: usize,
+    /// Special tokens added per assistant message by the chat template.
+    pub special_tokens_per_assistant_message: usize,
+    /// Fixed special tokens at conversation start.
+    pub conversation_start_tokens: usize,
 }
 
 impl Default for ConversationStateManagerConfig {
@@ -75,6 +84,10 @@ impl Default for ConversationStateManagerConfig {
             max_tokens_per_terminal_output: MAX_TOKENS_PER_TERMINAL_OUTPUT,
             max_tokens_per_conversation: None, // No chunking by default (for extension)
             min_conversation_messages: 5,
+            system_prompt: None,
+            special_tokens_per_user_message: 0,
+            special_tokens_per_assistant_message: 0,
+            conversation_start_tokens: 0,
         }
     }
 }
@@ -124,11 +137,18 @@ where
 {
     /// Create a new ConversationStateManager with the given tokenizer.
     pub fn new(tokenizer: T, config: ConversationStateManagerConfig) -> Self {
+        // Start with conversation overhead + system prompt tokens
+        let mut start_tokens = config.conversation_start_tokens;
+        if let Some(ref system_prompt) = config.system_prompt {
+            let system_tokens = tokenizer.count_tokens(system_prompt);
+            start_tokens += system_tokens + config.special_tokens_per_user_message;
+        }
+
         Self {
             tokenizer,
             config,
             messages: Vec::new(),
-            current_tokens: 0,
+            current_tokens: start_tokens,
             finalized_conversations: Vec::new(),
             file_states: HashMap::new(),
             per_file_viewport: HashMap::new(),
@@ -173,7 +193,12 @@ where
             self.messages.clear();
         }
 
-        self.current_tokens = 0;
+        // Reset with conversation start overhead + system prompt for next chunk
+        self.current_tokens = self.config.conversation_start_tokens;
+        if let Some(ref system_prompt) = self.config.system_prompt {
+            let system_tokens = self.tokenizer.count_tokens(system_prompt);
+            self.current_tokens += system_tokens + self.config.special_tokens_per_user_message;
+        }
         self.files_opened_in_conversation.clear();
     }
 
@@ -212,9 +237,16 @@ where
             tokens = self.config.max_tokens_per_message;
         }
 
+        // Add special tokens overhead from chat template (role-specific)
+        let overhead = match message.role {
+            Role::Assistant => self.config.special_tokens_per_assistant_message,
+            _ => self.config.special_tokens_per_user_message,
+        };
+        let tokens_with_overhead = tokens + overhead;
+
         // Check if we need to start a new conversation (chunking mode)
         if let Some(max_tokens) = self.config.max_tokens_per_conversation {
-            if self.current_tokens + tokens > max_tokens && !self.messages.is_empty() {
+            if self.current_tokens + tokens_with_overhead > max_tokens && !self.messages.is_empty() {
                 self.finalize_current_conversation();
                 // After starting a new conversation, we need to re-capture file states
                 // This will happen naturally as files are accessed
@@ -222,7 +254,7 @@ where
         }
 
         self.messages.push(message);
-        self.current_tokens += tokens;
+        self.current_tokens += tokens_with_overhead;
     }
 
     /// Capture file contents if not already shown in this conversation.
