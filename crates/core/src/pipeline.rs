@@ -37,6 +37,13 @@ pub struct PipelineConfig {
     pub viewport_radius: usize,
     pub coalesce_radius: usize,
     pub val_ratio: f64,
+    pub system_prompt: Option<String>,
+    /// Special tokens added per user/system message by the chat template.
+    pub special_tokens_per_user_message: usize,
+    /// Special tokens added per assistant message by the chat template.
+    pub special_tokens_per_assistant_message: usize,
+    /// Fixed special tokens at conversation start.
+    pub conversation_start_tokens: usize,
 }
 
 impl Default for PipelineConfig {
@@ -48,6 +55,10 @@ impl Default for PipelineConfig {
             viewport_radius: 10,
             coalesce_radius: 5,
             val_ratio: 0.1,
+            system_prompt: None,
+            special_tokens_per_user_message: 0,
+            special_tokens_per_assistant_message: 0,
+            conversation_start_tokens: 0,
         }
     }
 }
@@ -111,6 +122,10 @@ where
         max_tokens_per_terminal_output: 256,
         max_tokens_per_conversation: Some(config.max_tokens_per_conversation),
         min_conversation_messages: config.min_conversation_messages,
+        system_prompt: config.system_prompt.clone(),
+        special_tokens_per_user_message: config.special_tokens_per_user_message,
+        special_tokens_per_assistant_message: config.special_tokens_per_assistant_message,
+        conversation_start_tokens: config.conversation_start_tokens,
     };
 
     let mut manager = ConversationStateManager::new(tokenizer, manager_config);
