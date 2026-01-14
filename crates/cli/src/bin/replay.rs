@@ -24,12 +24,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use vt100::Parser as VtParser;
 use flate2::read::GzDecoder;
+use tar::Archive;
 
 #[derive(Parser, Debug)]
 #[command(name = "crowd-pilot-replay")]
 #[command(author, version, about = "Replay crowd-code 2.0 sessions", long_about = None)]
 struct Args {
-    /// Path to a crowd-code 2.0 recording JSON.gz file or directory of chunks
+    /// Path to a directory containing source_part_00x.tar.gz recordings
     #[arg(long)]
     session: PathBuf,
 
@@ -492,82 +493,96 @@ fn build_frames(session: &RecordingSession, rows: u16, cols: u16) -> Vec<Frame> 
     frames
 }
 
-fn read_session_file(path: &Path) -> Result<RecordingChunk, Box<dyn std::error::Error>> {
+fn is_chunk_entry(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.starts_with("chunk_") && name.ends_with(".json")
+}
+
+fn load_tar_chunks(path: &Path) -> Result<Vec<(String, RecordingChunk)>, Box<dyn std::error::Error>> {
     let file = fs::File::open(path)?;
-    let mut decoder = GzDecoder::new(file);
-    let mut payload = String::new();
-    decoder.read_to_string(&mut payload)?;
-    Ok(serde_json::from_str(&payload)?)
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    let mut chunks = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_path_buf();
+        let entry_path_str = entry_path.to_string_lossy().to_string();
+        let is_snapshot = entry_path_str.contains("/snapshots/") || entry_path_str.contains("\\snapshots\\");
+        if is_snapshot || !is_chunk_entry(&entry_path) {
+            continue;
+        }
+
+        let mut payload = String::new();
+        entry.read_to_string(&mut payload)?;
+        let chunk: RecordingChunk = serde_json::from_str(&payload)?;
+        let key = format!("{}:{}", path.display(), entry_path_str);
+        chunks.push((key, chunk));
+    }
+
+    Ok(chunks)
 }
 
 fn load_session(path: &Path) -> Result<RecordingSession, Box<dyn std::error::Error>> {
+    let mut entries: Vec<PathBuf> = Vec::new();
     if path.is_dir() {
-        let entries: Vec<PathBuf> = fs::read_dir(path)?
+        entries = fs::read_dir(path)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|entry| {
                 entry
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.ends_with(".json.gz"))
+                    .map(|name| name.ends_with(".tar.gz"))
                     .unwrap_or(false)
             })
             .collect();
-
-        if entries.is_empty() {
-            return Err("No session files found in directory".into());
-        }
-
-        let mut chunks: Vec<(PathBuf, RecordingChunk)> = Vec::new();
-        for entry in entries {
-            chunks.push((entry.clone(), read_session_file(&entry)?));
-        }
-
-        let has_chunk_index = chunks.iter().all(|(_, chunk)| chunk.chunk_index.is_some());
-        if has_chunk_index {
-            chunks.sort_by_key(|(_, chunk)| (chunk.chunk_index.unwrap_or(0), chunk.start_time));
-        } else {
-            chunks.sort_by_key(|(path, _)| path.clone());
-        }
-
-        let mut session: Option<RecordingSession> = None;
-        let mut events = Vec::new();
-
-        for (entry, chunk) in chunks {
-            if let Some(base) = &session {
-                if base.version != chunk.version {
-                    eprintln!(
-                        "Warning: version mismatch in {:?} ({} vs {})",
-                        entry, chunk.version, base.version
-                    );
-                }
-            } else {
-                session = Some(RecordingSession {
-                    version: chunk.version.clone(),
-                    _session_id: chunk.session_id.clone(),
-                    _start_time: chunk.start_time,
-                    events: Vec::new(),
-                });
-            }
-
-            events.extend(chunk.events);
-        }
-
-        let mut session = session.ok_or("No session files found in directory")?;
-        session.events = events;
-        Ok(session)
     } else {
-        if path.extension().and_then(|ext| ext.to_str()) != Some("gz") {
-            return Err("Only .json.gz files are supported for --session".into());
-        }
-        let chunk = read_session_file(path)?;
-        Ok(RecordingSession {
-            version: chunk.version,
-            _session_id: chunk.session_id,
-            _start_time: chunk.start_time,
-            events: chunk.events,
-        })
+        entries.push(path.to_path_buf());
     }
+
+    if entries.is_empty() {
+        return Err("No source_part_*.tar.gz files found in directory".into());
+    }
+
+    let mut chunks: Vec<(String, RecordingChunk)> = Vec::new();
+    for entry in entries {
+        chunks.extend(load_tar_chunks(&entry)?);
+    }
+
+    let has_chunk_index = chunks.iter().all(|(_, chunk)| chunk.chunk_index.is_some());
+    if has_chunk_index {
+        chunks.sort_by_key(|(_, chunk)| (chunk.chunk_index.unwrap_or(0), chunk.start_time));
+    } else {
+        chunks.sort_by_key(|(key, _)| key.clone());
+    }
+
+    let mut session: Option<RecordingSession> = None;
+    let mut events = Vec::new();
+
+    for (entry, chunk) in chunks {
+        if let Some(base) = &session {
+            if base.version != chunk.version {
+                eprintln!(
+                    "Warning: version mismatch in {} ({} vs {})",
+                    entry, chunk.version, base.version
+                );
+            }
+        } else {
+            session = Some(RecordingSession {
+                version: chunk.version.clone(),
+                _session_id: chunk.session_id.clone(),
+                _start_time: chunk.start_time,
+                events: Vec::new(),
+            });
+        }
+
+        events.extend(chunk.events);
+    }
+
+    let mut session = session.ok_or("No chunk_*.json files found in source parts")?;
+    session.events = events;
+    Ok(session)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
