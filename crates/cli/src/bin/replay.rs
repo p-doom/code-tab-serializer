@@ -225,6 +225,16 @@ fn format_line(start_line: u64, idx: usize, content: &str) -> String {
     format!("{:>6} | {}", start_line + idx as u64, expand_tabs(content))
 }
 
+fn split_at_char(s: &str, col: usize) -> (&str, &str) {
+    if col == 0 {
+        return ("", s);
+    }
+    match s.char_indices().nth(col) {
+        Some((idx, _)) => s.split_at(idx),
+        None => (s, ""),
+    }
+}
+
 fn render_editor_lines(viewport: &ViewportState) -> Vec<Line<'static>> {
     let lines: Vec<&str> = viewport.content.split('\n').collect();
     let start = viewport.start_line;
@@ -258,13 +268,14 @@ fn render_editor_lines(viewport: &ViewportState) -> Vec<Line<'static>> {
 
             let expanded = expand_tabs(line);
             let col = expand_column(line, cursor.character as usize);
-            let line_str = if col > expanded.len() {
-                format!("{}{}", expanded, " ".repeat(col - expanded.len()))
+            let expanded_chars = expanded.chars().count();
+            let line_str = if col > expanded_chars {
+                format!("{}{}", expanded, " ".repeat(col - expanded_chars))
             } else {
                 expanded
             };
 
-            let (prefix, rest) = line_str.split_at(col);
+            let (prefix, rest) = split_at_char(&line_str, col);
             let mut chars = rest.chars();
             let cursor_char = chars.next().unwrap_or(' ');
 
