@@ -93,6 +93,18 @@ This reads CSV session files, processes them through the Rust serializer, and ou
 | `--coalesce-radius` | 5 | Radius for grouping nearby edits |
 | `--val-ratio` | 0.10 | Fraction of sessions for validation |
 
+### CLI (Replay crowd-code 2.0)
+
+```bash
+crowd-pilot-replay \
+    --session ./recordings \
+    --terminal-cols 120 \
+    --terminal-rows 30 \
+    --delay-ms 100
+```
+
+This replays crowd-code 2.0 recordings and renders editor + terminal viewports. The `--session` path must be a single `source_part_*.tar.gz` file or a directory containing those `.tar.gz` parts. Terminal output is VT-rendered from terminal bytestream events when available; otherwise it falls back to the recorded terminal viewport lines.
+
 ## License
 
 Apache 2.0
