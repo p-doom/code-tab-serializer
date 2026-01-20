@@ -235,6 +235,42 @@ fn split_at_char(s: &str, col: usize) -> (&str, &str) {
     }
 }
 
+/// Render unified diff lines with syntax highlighting
+fn render_diff_lines(diff: &str) -> Vec<Line<'static>> {
+    diff.lines()
+        .map(|line| {
+            if line.starts_with("+++") || line.starts_with("---") {
+                // File headers - dim
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            } else if line.starts_with("@@") {
+                // Hunk headers - cyan
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ))
+            } else if line.starts_with('+') {
+                // Added lines - green
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Green),
+                ))
+            } else if line.starts_with('-') {
+                // Removed lines - red
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Red),
+                ))
+            } else {
+                // Context lines - default
+                Line::from(line.to_string())
+            }
+        })
+        .collect()
+}
+
 fn render_editor_lines(viewport: &ViewportState) -> Vec<Line<'static>> {
     let lines: Vec<&str> = viewport.content.split('\n').collect();
     let start = viewport.start_line;
@@ -292,6 +328,14 @@ fn render_editor_lines(viewport: &ViewportState) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Represents an agent edit diff for display
+#[derive(Clone)]
+struct AgentDiff {
+    file: String,
+    change_type: String,
+    diff: String,
+}
+
 #[derive(Clone)]
 struct Frame {
     sequence: u64,
@@ -300,6 +344,7 @@ struct Frame {
     terminal_title: String,
     terminal_lines: Vec<String>,
     action_log: Vec<String>,
+    agent_diffs: Vec<AgentDiff>,
 }
 
 impl Frame {
@@ -317,6 +362,41 @@ impl Frame {
                 .iter()
                 .all(|l| l.trim().is_empty() || l.trim() == "<no active terminal>")
     }
+
+    fn has_agent_diffs(&self) -> bool {
+        !self.agent_diffs.is_empty()
+    }
+}
+
+/// Extract agent diff from a file_change action if source is "agent"
+fn extract_agent_diff(action: &Value) -> Option<AgentDiff> {
+    let kind = action.get("kind")?.as_str()?;
+    if kind != "file_change" {
+        return None;
+    }
+    
+    let source = action.get("source").and_then(|v| v.as_str())?;
+    if source != "agent" {
+        return None;
+    }
+    
+    let file = action.get("file").and_then(|v| v.as_str())?.to_string();
+    let change_type = action
+        .get("changeType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("change")
+        .to_string();
+    let diff = action
+        .get("diff")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    
+    Some(AgentDiff {
+        file,
+        change_type,
+        diff,
+    })
 }
 
 fn render_ui<B: ratatui::backend::Backend>(
@@ -373,24 +453,69 @@ fn render_ui<B: ratatui::backend::Backend>(
             .wrap(Wrap { trim: false });
         f.render_widget(term, layout[2]);
 
-        // Actions overlay
-        let overlay_width: u16 = 48;
-        let overlay_height: u16 = (frame.action_log.len() as u16).clamp(1, 6) + 2;
-        if size.width > overlay_width + 2 && size.height > overlay_height + 1 {
-            let rect = Rect::new(size.width - overlay_width - 1, 1, overlay_width, overlay_height.min(size.height - 1));
-            f.render_widget(Clear, rect);
-            let actions: Vec<Line> = if frame.action_log.is_empty() {
-                vec![Line::from("<no recent actions>")]
-            } else {
-                frame.action_log.iter().rev().take(5).map(|l| Line::from(l.clone())).collect()
-            };
-            let overlay = Paragraph::new(Text::from(actions))
-                .block(Block::default().borders(Borders::ALL).title("recent actions"))
-                .wrap(Wrap { trim: true });
-            f.render_widget(overlay, rect);
+        // Overlay: show diff panel if agent diffs present, otherwise show actions
+        if frame.has_agent_diffs() {
+            // Agent diff panel - larger to show diff content
+            let overlay_width: u16 = 60.min(size.width.saturating_sub(4));
+            let overlay_height: u16 = 15.min(size.height.saturating_sub(4));
+            
+            if size.width > overlay_width + 2 && size.height > overlay_height + 1 {
+                let rect = Rect::new(
+                    size.width - overlay_width - 1,
+                    1,
+                    overlay_width,
+                    overlay_height,
+                );
+                f.render_widget(Clear, rect);
+                
+                // Show the most recent agent diff
+                let latest_diff = frame.agent_diffs.last().unwrap();
+                let (added, removed) = count_diff_lines(&latest_diff.diff);
+                let title = format!(
+                    "agent {}: {} (+{}/-{})",
+                    latest_diff.change_type, latest_diff.file, added, removed
+                );
+                
+                let diff_lines = render_diff_lines(&latest_diff.diff);
+                let overlay = Paragraph::new(Text::from(diff_lines))
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(overlay, rect);
+            }
+        } else {
+            // Actions overlay (original behavior)
+            let overlay_width: u16 = 48;
+            let overlay_height: u16 = (frame.action_log.len() as u16).clamp(1, 6) + 2;
+            if size.width > overlay_width + 2 && size.height > overlay_height + 1 {
+                let rect = Rect::new(size.width - overlay_width - 1, 1, overlay_width, overlay_height.min(size.height - 1));
+                f.render_widget(Clear, rect);
+                let actions: Vec<Line> = if frame.action_log.is_empty() {
+                    vec![Line::from("<no recent actions>")]
+                } else {
+                    frame.action_log.iter().rev().take(5).map(|l| Line::from(l.clone())).collect()
+                };
+                let overlay = Paragraph::new(Text::from(actions))
+                    .block(Block::default().borders(Borders::ALL).title("recent actions"))
+                    .wrap(Wrap { trim: true });
+                f.render_widget(overlay, rect);
+            }
         }
     })?;
     Ok(())
+}
+
+/// Count added/removed lines in a unified diff string
+fn count_diff_lines(diff: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
 }
 
 fn summarize_action(action: &Value) -> Option<String> {
@@ -400,9 +525,9 @@ fn summarize_action(action: &Value) -> Option<String> {
         "terminal_command" => {
             let command = action.get("command").and_then(|v| v.as_str()).unwrap_or("<command?>");
             if let Some(term) = get_field(action, &["terminalName", "terminal_name"]) {
-                format!("terminal command ({}): {}", term, command.trim())
+                format!("cmd ({}): {}", term, command.trim())
             } else {
-                format!("terminal command: {}", command.trim())
+                format!("cmd: {}", command.trim())
             }
         }
         "selection" => {
@@ -422,6 +547,52 @@ fn summarize_action(action: &Value) -> Option<String> {
                 _ => format!("selection: {}", file),
             }
         }
+        "edit" => {
+            let file = action.get("file").and_then(|v| v.as_str()).unwrap_or("<file?>");
+            let source = action.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+            let diff = action.get("diff");
+            let chars_added = diff
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .map(|t| t.len())
+                .unwrap_or(0);
+            let chars_removed = diff
+                .and_then(|d| d.get("rangeLength"))
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as usize;
+            format!("edit ({}): {} +{}/-{} chars", source, file, chars_added, chars_removed)
+        }
+        "file_change" => {
+            let file = action.get("file").and_then(|v| v.as_str()).unwrap_or("<file?>");
+            let source = action.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+            let change_type = action.get("changeType").and_then(|v| v.as_str()).unwrap_or("change");
+            let diff_str = action.get("diff").and_then(|v| v.as_str());
+            
+            let diff_summary = if let Some(d) = diff_str {
+                let (added, removed) = count_diff_lines(d);
+                format!(" +{}/-{}", added, removed)
+            } else {
+                String::new()
+            };
+            
+            match source {
+                "agent" => format!("agent {}: {}{}", change_type, file, diff_summary),
+                "git" | "git_checkout" => format!("git: {} ({})", file, change_type),
+                _ => format!("{}: {} ({}){}", source, file, change_type, diff_summary),
+            }
+        }
+        "tab_switch" => {
+            let file = action.get("file").and_then(|v| v.as_str()).unwrap_or("<file?>");
+            let prev = action.get("previousFile").and_then(|v| v.as_str());
+            match prev {
+                Some(p) => format!("tab: {} → {}", p, file),
+                None => format!("tab: → {}", file),
+            }
+        }
+        "terminal_focus" => {
+            let term = get_field(action, &["terminalName", "terminal_name"]).unwrap_or_else(|| "<terminal?>".to_string());
+            format!("focus: {}", term)
+        }
         _ => {
             if let Some(file) = action.get("file").and_then(|v| v.as_str()) {
                 format!("{}: {}", kind, file)
@@ -440,11 +611,22 @@ fn build_frames(session: &RecordingSession, rows: u16, cols: u16) -> Vec<Frame> 
     let mut state = ReplayState::new();
     let mut frames = Vec::new();
     let mut action_log: Vec<String> = Vec::new();
+    let mut agent_diffs: Vec<AgentDiff> = Vec::new();
 
     for event in &session.events {
         match event {
             RecordingEvent::Action { action, .. } => {
                 handle_action(action, &mut state, rows, cols);
+                
+                // Track agent diffs separately
+                if let Some(agent_diff) = extract_agent_diff(action) {
+                    agent_diffs.push(agent_diff);
+                    // Keep only recent agent diffs (max 10)
+                    if agent_diffs.len() > 10 {
+                        agent_diffs.drain(0..agent_diffs.len() - 10);
+                    }
+                }
+                
                 if let Some(summary) = summarize_action(action) {
                     action_log.push(summary);
                     if action_log.len() > 50 {
@@ -495,7 +677,12 @@ fn build_frames(session: &RecordingSession, rows: u16, cols: u16) -> Vec<Frame> 
                     terminal_title,
                     terminal_lines,
                     action_log: action_log.clone(),
+                    agent_diffs: agent_diffs.clone(),
                 });
+                
+                // Clear agent diffs after including them in a frame
+                // (so each frame shows diffs that occurred since last observation)
+                agent_diffs.clear();
             }
             RecordingEvent::WorkspaceSnapshot { .. } => {}
         }
