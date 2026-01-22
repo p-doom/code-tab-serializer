@@ -6,11 +6,11 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokenizers::Tokenizer as HfTokenizer;
 
 use crowd_pilot_serializer_core::{
-    default_system_prompt,
+    convert_yaml_file, default_system_prompt,
     pipeline::{PipelineConfig, PipelineResult},
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
@@ -32,23 +32,27 @@ fn chat_template_overhead(name: &str) -> Option<(usize, usize, usize)> {
 #[derive(Parser, Debug)]
 #[command(name = "crowd-pilot-serialize")]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // Legacy args for backwards compatibility (when no subcommand is used)
     /// Root directory containing CSV session files
     #[arg(long)]
-    csv_root: PathBuf,
+    csv_root: Option<PathBuf>,
 
     /// Output directory for JSONL files
     #[arg(long)]
-    output_dir: PathBuf,
+    output_dir: Option<PathBuf>,
 
     /// HuggingFace tokenizer model name or path
     #[arg(long)]
-    tokenizer: String,
+    tokenizer: Option<String>,
 
     /// Chat template format for accurate token counting (required).
     /// Supported: qwen3, glm45
     #[arg(long)]
-    chat_template: String,
+    chat_template: Option<String>,
 
     /// Maximum tokens per conversation chunk
     #[arg(long, default_value = "8192")]
@@ -77,6 +81,20 @@ struct Args {
     /// Custom system prompt (optional)
     #[arg(long)]
     system_prompt: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Convert YAML state-based eval files to markdown+sed format
+    YamlToMd {
+        /// Input YAML file or directory containing YAML files
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output markdown file or directory
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 /// Wrapper around HuggingFace tokenizers for token counting and truncation.
@@ -123,71 +141,130 @@ impl Tokenizer for RustTokenizer {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+fn run_yaml_to_md(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if input.is_dir() {
+        // Process all YAML files in directory
+        std::fs::create_dir_all(output)?;
+
+        let entries: Vec<_> = std::fs::read_dir(input)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "yaml" || ext == "yml")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        println!("Converting {} YAML files...", entries.len());
+
+        for entry in entries {
+            let yaml_path = entry.path();
+            let stem = yaml_path.file_stem().unwrap().to_string_lossy();
+            let md_path = output.join(format!("{}.md", stem));
+
+            let yaml_content = std::fs::read_to_string(&yaml_path)?;
+            let md_content = convert_yaml_file(&yaml_content)
+                .map_err(|e| format!("Error converting {:?}: {}", yaml_path, e))?;
+
+            std::fs::write(&md_path, &md_content)?;
+            println!("  {} -> {}", yaml_path.display(), md_path.display());
+        }
+    } else {
+        // Process single file
+        let yaml_content = std::fs::read_to_string(input)?;
+        let md_content = convert_yaml_file(&yaml_content)?;
+        std::fs::write(output, &md_content)?;
+        println!("Converted {} -> {}", input.display(), output.display());
+    }
+
+    Ok(())
+}
+
+fn run_serialize(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let csv_root = cli
+        .csv_root
+        .as_ref()
+        .ok_or("--csv-root is required for serialization")?;
+    let output_dir = cli
+        .output_dir
+        .as_ref()
+        .ok_or("--output-dir is required for serialization")?;
+    let tokenizer_name = cli
+        .tokenizer
+        .as_ref()
+        .ok_or("--tokenizer is required for serialization")?;
+    let chat_template = cli
+        .chat_template
+        .as_ref()
+        .ok_or("--chat-template is required for serialization")?;
 
     let (special_tokens_per_user, special_tokens_per_assistant, conversation_start_tokens) =
-        chat_template_overhead(&args.chat_template).ok_or_else(|| {
+        chat_template_overhead(chat_template).ok_or_else(|| {
             format!(
                 "Unknown chat template: '{}'. Supported: qwen3, glm45",
-                args.chat_template
+                chat_template
             )
         })?;
 
-    println!("Loading tokenizer from {}...", args.tokenizer);
-    let tokenizer = RustTokenizer::load(&args.tokenizer)?;
+    println!("Loading tokenizer from {}...", tokenizer_name);
+    let tokenizer = RustTokenizer::load(tokenizer_name)?;
 
-    println!("  Chat template: {}", args.chat_template);
-    println!("  Per user/system message overhead: {} tokens", special_tokens_per_user);
-    println!("  Per assistant message overhead: {} tokens", special_tokens_per_assistant);
-    println!("  Conversation start overhead: {} tokens", conversation_start_tokens);
+    println!("  Chat template: {}", chat_template);
+    println!(
+        "  Per user/system message overhead: {} tokens",
+        special_tokens_per_user
+    );
+    println!(
+        "  Per assistant message overhead: {} tokens",
+        special_tokens_per_assistant
+    );
+    println!(
+        "  Conversation start overhead: {} tokens",
+        conversation_start_tokens
+    );
 
-    let default_prompt = default_system_prompt(args.viewport_radius);
-    let system_prompt = args.system_prompt.clone().unwrap_or(default_prompt.clone());
+    let default_prompt = default_system_prompt(cli.viewport_radius);
+    let system_prompt = cli
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| default_prompt.clone());
 
     let config = PipelineConfig {
-        max_tokens_per_conversation: args.max_tokens_per_conversation,
-        max_tokens_per_message: args.max_tokens_per_message,
-        min_conversation_messages: args.min_conversation_messages,
-        viewport_radius: args.viewport_radius,
-        coalesce_radius: args.coalesce_radius,
-        val_ratio: args.val_ratio,
+        max_tokens_per_conversation: cli.max_tokens_per_conversation,
+        max_tokens_per_message: cli.max_tokens_per_message,
+        min_conversation_messages: cli.min_conversation_messages,
+        viewport_radius: cli.viewport_radius,
+        coalesce_radius: cli.coalesce_radius,
+        val_ratio: cli.val_ratio,
         system_prompt: Some(system_prompt.clone()),
         special_tokens_per_user_message: special_tokens_per_user,
         special_tokens_per_assistant_message: special_tokens_per_assistant,
         conversation_start_tokens,
     };
 
-    println!("Processing CSV files from {:?}...", args.csv_root);
-    let session_results = process_all_sessions(
-        &args.csv_root,
-        &tokenizer,
-        &config,
-    )?;
+    println!("Processing CSV files from {:?}...", csv_root);
+    let session_results = process_all_sessions(csv_root, &tokenizer, &config)?;
 
     let total_sessions = session_results.len();
     println!("Processed {} sessions", total_sessions);
 
-    println!("Writing output to {:?}...", args.output_dir);
-    let result: PipelineResult = write_jsonl_output(
-        session_results,
-        &args.output_dir,
-        args.val_ratio,
-        &system_prompt,
-    )?;
+    println!("Writing output to {:?}...", output_dir);
+    let result: PipelineResult =
+        write_jsonl_output(session_results, output_dir, cli.val_ratio, &system_prompt)?;
 
-    let metadata_path = args.output_dir.join("metadata.json");
+    let metadata_path = output_dir.join("metadata.json");
     let metadata = serde_json::json!({
         "config": {
-            "csv_root": args.csv_root.to_string_lossy(),
-            "output_dir": args.output_dir.to_string_lossy(),
-            "tokenizer": args.tokenizer,
-            "max_tokens_per_conversation": args.max_tokens_per_conversation,
-            "max_tokens_per_message": args.max_tokens_per_message,
-            "min_conversation_messages": args.min_conversation_messages,
-            "viewport_radius": args.viewport_radius,
-            "coalesce_radius": args.coalesce_radius,
-            "val_ratio": args.val_ratio,
+            "csv_root": csv_root.to_string_lossy(),
+            "output_dir": output_dir.to_string_lossy(),
+            "tokenizer": tokenizer_name,
+            "max_tokens_per_conversation": cli.max_tokens_per_conversation,
+            "max_tokens_per_message": cli.max_tokens_per_message,
+            "min_conversation_messages": cli.min_conversation_messages,
+            "viewport_radius": cli.viewport_radius,
+            "coalesce_radius": cli.coalesce_radius,
+            "val_ratio": cli.val_ratio,
         },
         "counts": {
             "total_sessions": result.total_sessions,
@@ -210,8 +287,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         "files": {
-            "train_path": args.output_dir.join("training.jsonl").to_string_lossy(),
-            "val_path": args.output_dir.join("validation.jsonl").to_string_lossy(),
+            "train_path": output_dir.join("training.jsonl").to_string_lossy(),
+            "val_path": output_dir.join("validation.jsonl").to_string_lossy(),
         },
     });
     std::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)?;
@@ -222,8 +299,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Val conversations: {}", result.val_conversations);
     println!("  Total messages: {}", result.total_messages);
     println!("  Total tokens: {}", result.total_tokens);
-    println!("  Output: {:?}/{{training,validation}}.jsonl", args.output_dir);
+    println!(
+        "  Output: {:?}/{{training,validation}}.jsonl",
+        output_dir
+    );
     println!("  Metadata: {:?}", metadata_path);
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Some(Commands::YamlToMd { input, output }) => {
+            run_yaml_to_md(input, output)?;
+        }
+        None => {
+            // Legacy mode: run serialization
+            run_serialize(&cli)?;
+        }
+    }
 
     Ok(())
 }
