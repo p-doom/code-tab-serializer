@@ -33,7 +33,7 @@ mod conversation;
 mod diff;
 mod helpers;
 pub mod pipeline;
-pub mod yaml_to_md;
+pub mod yaml_to_testcases;
 
 pub use conversation::{ConversationMessage, ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
 pub use pipeline::{
@@ -45,7 +45,7 @@ pub use helpers::{
     apply_backspaces, apply_change, clean_text, escape_single_quotes_for_sed, fenced_block,
     line_numbered_output, normalize_terminal_output, serialize_compute_viewport, Viewport,
 };
-pub use yaml_to_md::{convert_yaml_file, yaml_to_markdown, Action, ActionType, State, Task};
+pub use yaml_to_testcases::{convert_yaml_to_testcases, yaml_to_testcases, TestCase, TestCaseMessage};
 
 /// Default viewport radius (lines above/below cursor to show)
 pub const VIEWPORT_RADIUS: usize = 10;

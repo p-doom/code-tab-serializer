@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use tokenizers::Tokenizer as HfTokenizer;
 
 use crowd_pilot_serializer_core::{
-    convert_yaml_file, default_system_prompt,
+    convert_yaml_to_testcases, default_system_prompt,
     pipeline::{PipelineConfig, PipelineResult},
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
@@ -85,13 +85,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Convert YAML state-based eval files to markdown+sed format
-    YamlToMd {
+    /// Convert YAML state-based eval files directly to test cases JSONL
+    YamlToTestcases {
         /// Input YAML file or directory containing YAML files
         #[arg(long)]
         input: PathBuf,
 
-        /// Output markdown file or directory
+        /// Output JSONL file
         #[arg(long)]
         output: PathBuf,
     },
@@ -141,11 +141,10 @@ impl Tokenizer for RustTokenizer {
     }
 }
 
-fn run_yaml_to_md(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    if input.is_dir() {
-        // Process all YAML files in directory
-        std::fs::create_dir_all(output)?;
+fn run_yaml_to_testcases(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let mut all_test_cases = Vec::new();
 
+    if input.is_dir() {
         let entries: Vec<_> = std::fs::read_dir(input)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -156,28 +155,38 @@ fn run_yaml_to_md(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::
             })
             .collect();
 
-        println!("Converting {} YAML files...", entries.len());
+        println!("Converting {} YAML files to test cases...", entries.len());
 
         for entry in entries {
             let yaml_path = entry.path();
-            let stem = yaml_path.file_stem().unwrap().to_string_lossy();
-            let md_path = output.join(format!("{}.md", stem));
-
             let yaml_content = std::fs::read_to_string(&yaml_path)?;
-            let md_content = convert_yaml_file(&yaml_content)
+            let test_cases = convert_yaml_to_testcases(&yaml_content)
                 .map_err(|e| format!("Error converting {:?}: {}", yaml_path, e))?;
-
-            std::fs::write(&md_path, &md_content)?;
-            println!("  {} -> {}", yaml_path.display(), md_path.display());
+            
+            println!("  {} -> {} test cases", yaml_path.display(), test_cases.len());
+            all_test_cases.extend(test_cases);
         }
     } else {
         // Process single file
         let yaml_content = std::fs::read_to_string(input)?;
-        let md_content = convert_yaml_file(&yaml_content)?;
-        std::fs::write(output, &md_content)?;
-        println!("Converted {} -> {}", input.display(), output.display());
+        let test_cases = convert_yaml_to_testcases(&yaml_content)?;
+        println!("Converted {} -> {} test cases", input.display(), test_cases.len());
+        all_test_cases.extend(test_cases);
     }
 
+    // Write all test cases to output JSONL file
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    
+    let mut output_file = std::fs::File::create(output)?;
+    use std::io::Write;
+    for test_case in &all_test_cases {
+        let json = serde_json::to_string(test_case)?;
+        writeln!(output_file, "{}", json)?;
+    }
+
+    println!("Wrote {} test cases to {}", all_test_cases.len(), output.display());
     Ok(())
 }
 
@@ -312,8 +321,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::YamlToMd { input, output }) => {
-            run_yaml_to_md(input, output)?;
+        Some(Commands::YamlToTestcases { input, output }) => {
+            run_yaml_to_testcases(input, output)?;
         }
         None => {
             // Legacy mode: run serialization
