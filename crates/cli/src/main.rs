@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use tokenizers::Tokenizer as HfTokenizer;
 
 use crowd_pilot_serializer_core::{
-    convert_yaml_to_testcases, default_system_prompt,
+    convert_yaml_to_testcases, convert_yaml_to_zeta, default_system_prompt, format_zeta_markdown,
     pipeline::{PipelineConfig, PipelineResult},
     process_all_sessions, write_jsonl_output, Tokenizer,
 };
@@ -92,6 +92,16 @@ enum Commands {
         input: PathBuf,
 
         /// Output JSONL file
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Convert YAML state-based eval files to Zeta markdown format
+    YamlToZeta {
+        /// Input YAML file or directory containing YAML files
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output directory for Zeta markdown files
         #[arg(long)]
         output: PathBuf,
     },
@@ -317,12 +327,75 @@ fn run_serialize(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_yaml_to_zeta(input: &PathBuf, output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(output)?;
+
+    if input.is_dir() {
+        let entries: Vec<_> = std::fs::read_dir(input)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "yaml" || ext == "yml")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        println!("Converting {} YAML files to Zeta format...", entries.len());
+
+        let mut total_test_cases = 0;
+        for entry in entries {
+            let yaml_path = entry.path();
+            let yaml_content = std::fs::read_to_string(&yaml_path)?;
+            let test_cases = convert_yaml_to_zeta(&yaml_content)
+                .map_err(|e| format!("Error converting {:?}: {}", yaml_path, e))?;
+
+            let file_stem = yaml_path.file_stem().unwrap().to_string_lossy();
+            for (i, test_case) in test_cases.iter().enumerate() {
+                let output_name = if test_cases.len() == 1 {
+                    format!("{}.md", file_stem)
+                } else {
+                    format!("{}_{}.md", file_stem, i)
+                };
+                let output_path = output.join(&output_name);
+                let md_content = format_zeta_markdown(test_case);
+                std::fs::write(&output_path, md_content)?;
+            }
+
+            println!("  {} -> {} test cases", yaml_path.display(), test_cases.len());
+            total_test_cases += test_cases.len();
+        }
+        println!("Total: {} Zeta test cases written to {}", total_test_cases, output.display());
+    } else {
+        let yaml_content = std::fs::read_to_string(input)?;
+        let test_cases = convert_yaml_to_zeta(&yaml_content)?;
+
+        let file_stem = input.file_stem().unwrap().to_string_lossy();
+        for (i, test_case) in test_cases.iter().enumerate() {
+            let output_name = if test_cases.len() == 1 {
+                format!("{}.md", file_stem)
+            } else {
+                format!("{}_{}.md", file_stem, i)
+            };
+            let output_path = output.join(&output_name);
+            let md_content = format_zeta_markdown(test_case);
+            std::fs::write(&output_path, md_content)?;
+        }
+        println!("Converted {} -> {} Zeta test cases", input.display(), test_cases.len());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Commands::YamlToTestcases { input, output }) => {
             run_yaml_to_testcases(input, output)?;
+        }
+        Some(Commands::YamlToZeta { input, output }) => {
+            run_yaml_to_zeta(input, output)?;
         }
         None => {
             // Legacy mode: run serialization

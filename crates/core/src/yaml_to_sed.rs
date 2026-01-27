@@ -1,59 +1,12 @@
-//! Convert YAML state-based evaluation files directly to test cases JSONL format.
-//!
-//! This module converts YAML files containing file states at each step directly
-//! to the test cases format used for evaluation.
-
-use std::collections::HashMap;
+//! Convert YAML evals to SED-based test cases format.
 
 use serde::{Deserialize, Serialize};
 
 use crate::diff::compute_changed_block_lines;
 use crate::helpers::{escape_single_quotes_for_sed, line_numbered_output, serialize_compute_viewport};
+use crate::yaml_types::{find_all_changed_files, has_terminal_command, parse_yaml_task, State, Task};
 use crate::VIEWPORT_RADIUS;
 
-// ============================================================================
-// YAML Types
-// ============================================================================
-
-/// A cursor position in a file.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Cursor {
-    pub file: Option<String>,
-    pub line: usize,
-    pub column: usize,
-}
-
-/// Terminal state (command and output).
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Terminal {
-    pub command: Option<String>,
-    pub output: Option<String>,
-}
-
-/// A single state snapshot in the YAML format.
-#[derive(Debug, Clone, Deserialize)]
-pub struct State {
-    pub files: Option<HashMap<String, String>>,
-    pub cursor: Option<Cursor>,
-    pub terminal: Option<Terminal>,
-    #[serde(rename = "eval")]
-    pub eval_tag: Option<String>,
-    pub judge_assertions: Option<String>,
-}
-
-/// A task containing multiple states.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Task {
-    pub task_id: String,
-    pub description: Option<String>,
-    pub states: Vec<State>,
-}
-
-// ============================================================================
-// Action Types
-// ============================================================================
-
-/// Action types that can be derived from state transitions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionType {
     Navigation,
@@ -61,7 +14,6 @@ pub enum ActionType {
     Terminal,
 }
 
-/// A derived action with its command and output.
 #[derive(Debug, Clone)]
 pub struct Action {
     pub action_type: ActionType,
@@ -71,11 +23,6 @@ pub struct Action {
     pub assertions: Option<String>,
 }
 
-// ============================================================================
-// Test Case Types
-// ============================================================================
-
-/// A message in the test case context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestCaseMessage {
     pub role: String,
@@ -84,7 +31,6 @@ pub struct TestCaseMessage {
     pub assertions: Option<String>,
 }
 
-/// A test case for evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestCase {
     pub task_id: String,
@@ -93,11 +39,7 @@ pub struct TestCase {
     pub assertions: Option<String>,
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Apply heuristic to handle blank lines at insert boundaries more naturally.
+/// Handles blank lines at insert boundaries to produce cleaner diffs.
 fn apply_blank_line_heuristic(
     mut start_before: usize,
     end_before: usize,
@@ -108,7 +50,6 @@ fn apply_blank_line_heuristic(
 ) -> (usize, usize, usize, usize, Vec<String>) {
     let is_insert = end_before < start_before;
 
-    // Handle leading blank lines
     while !replacement_lines.is_empty() && replacement_lines[0].trim().is_empty() {
         if is_insert {
             let check_idx = start_before.saturating_sub(1);
@@ -130,7 +71,6 @@ fn apply_blank_line_heuristic(
         }
     }
 
-    // Handle trailing blank lines
     while !replacement_lines.is_empty() && replacement_lines.last().unwrap().trim().is_empty() {
         let check_idx = if is_insert {
             start_before.saturating_sub(1)
@@ -148,7 +88,6 @@ fn apply_blank_line_heuristic(
     (start_before, end_before, start_after, end_after, replacement_lines)
 }
 
-/// Generate a sed command for a file edit.
 fn generate_sed_command(
     filepath: &str,
     old_content: &str,
@@ -195,7 +134,6 @@ fn generate_sed_command(
         )
     };
 
-    // Compute viewport
     let center_line = if is_insert {
         start_before + replacement_lines.len() / 2
     } else if is_delete {
@@ -219,14 +157,11 @@ fn generate_sed_command(
     );
 
     let full_cmd = format!("{} && {}", sed_cmd, cat_cmd);
-
-    // Generate expected output
     let output = line_numbered_output(new_content, Some(viewport.start), Some(viewport.end));
 
     Some((full_cmd, output))
 }
 
-/// Generate cat command output for a file.
 fn generate_cat_output(filepath: &str, content: &str, cursor_line: usize) -> (String, String) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -247,7 +182,6 @@ fn generate_cat_output(filepath: &str, content: &str, cursor_line: usize) -> (St
     (cmd, output)
 }
 
-/// Derive an action from a state transition.
 fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
     let eval_tag = curr_state
         .eval_tag
@@ -255,22 +189,34 @@ fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
         .unwrap_or_else(|| "NO_EVAL".to_string());
     let assertions = curr_state.judge_assertions.clone();
 
-    // Check for terminal command
-    if let Some(terminal) = &curr_state.terminal {
-        if let Some(cmd) = &terminal.command {
+    if has_terminal_command(curr_state) {
+        let terminal = curr_state.terminal.as_ref().unwrap();
+        let cmd = terminal.command.as_ref().unwrap();
+        return Action {
+            action_type: ActionType::Terminal,
+            command: cmd.clone(),
+            output: terminal.output.clone(),
+            eval_tag,
+            assertions,
+        };
+    }
+
+    let prev_files = prev_state.and_then(|s| s.files.as_ref());
+    let curr_files = curr_state.files.as_ref();
+
+    // Try all changed files until one produces a valid sed command
+    let changed_files = find_all_changed_files(prev_files, curr_files);
+    for (filepath, old_content, new_content) in &changed_files {
+        if let Some((cmd, output)) = generate_sed_command(filepath, old_content, new_content) {
             return Action {
-                action_type: ActionType::Terminal,
-                command: cmd.clone(),
-                output: terminal.output.clone(),
+                action_type: ActionType::Edit,
+                command: cmd,
+                output: Some(output),
                 eval_tag,
                 assertions,
             };
         }
     }
-
-    // Check for file changes
-    let prev_files = prev_state.and_then(|s| s.files.as_ref());
-    let curr_files = curr_state.files.as_ref();
 
     if let Some(curr) = curr_files {
         for (filepath, new_content) in curr {
@@ -279,21 +225,7 @@ fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
-            if old_content != new_content {
-                // File was edited
-                if let Some((cmd, output)) =
-                    generate_sed_command(filepath, old_content, new_content)
-                {
-                    return Action {
-                        action_type: ActionType::Edit,
-                        command: cmd,
-                        output: Some(output),
-                        eval_tag,
-                        assertions,
-                    };
-                }
-            } else if old_content.is_empty() && !new_content.is_empty() {
-                // New file opened
+            if old_content.is_empty() && !new_content.is_empty() {
                 let cursor_line = curr_state
                     .cursor
                     .as_ref()
@@ -310,7 +242,6 @@ fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
             }
         }
 
-        // Check for navigation (cursor file specified, no edit)
         if let Some(cursor) = &curr_state.cursor {
             if let Some(file) = &cursor.file {
                 if let Some(content) = curr.get(file) {
@@ -327,7 +258,6 @@ fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
         }
     }
 
-    // Empty action
     Action {
         action_type: ActionType::Navigation,
         command: String::new(),
@@ -337,16 +267,10 @@ fn derive_action(prev_state: Option<&State>, curr_state: &State) -> Action {
     }
 }
 
-// ============================================================================
-// Conversion Functions
-// ============================================================================
-
-/// Format an action's command as a bash code block.
 fn format_command(command: &str) -> String {
     format!("```bash\n{}\n```", command)
 }
 
-/// Format output as stdout block.
 fn format_output(output: &str) -> String {
     if output.is_empty() {
         "<stdout>\n</stdout>".to_string()
@@ -355,10 +279,7 @@ fn format_output(output: &str) -> String {
     }
 }
 
-/// Convert a YAML task to test cases.
-///
-/// Creates one test case for each EVAL-tagged assistant turn, with all preceding
-/// turns as context.
+/// Creates one test case per EVAL-tagged turn, with preceding turns as context.
 pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
     let mut test_cases = Vec::new();
     let mut all_messages: Vec<TestCaseMessage> = Vec::new();
@@ -369,13 +290,11 @@ pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
     for curr_state in &task.states {
         let action = derive_action(prev_state, curr_state);
 
-        // Skip empty actions
         if action.command.is_empty() {
             prev_state = Some(curr_state);
             continue;
         }
 
-        // Add assistant message
         let assistant_msg = TestCaseMessage {
             role: "assistant".to_string(),
             content: format_command(&action.command),
@@ -383,7 +302,6 @@ pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
             assertions: action.assertions.clone(),
         };
 
-        // Add user message (output)
         let user_msg = if let Some(output) = &action.output {
             Some(TestCaseMessage {
                 role: "user".to_string(),
@@ -395,7 +313,6 @@ pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
             None
         };
 
-        // If this is an EVAL turn, create a test case
         if action.eval_tag == "EVAL" {
             let context = all_messages.clone();
 
@@ -409,7 +326,6 @@ pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
             eval_count += 1;
         }
 
-        // Add messages to running list for future contexts
         all_messages.push(assistant_msg);
         if let Some(msg) = user_msg {
             all_messages.push(msg);
@@ -421,11 +337,8 @@ pub fn yaml_to_testcases(task: &Task) -> Vec<TestCase> {
     test_cases
 }
 
-/// Parse a YAML file and convert to test cases.
 pub fn convert_yaml_to_testcases(yaml_content: &str) -> Result<Vec<TestCase>, String> {
-    let task: Task =
-        serde_yaml::from_str(yaml_content).map_err(|e| format!("Failed to parse YAML: {}", e))?;
-
+    let task = parse_yaml_task(yaml_content)?;
     Ok(yaml_to_testcases(&task))
 }
 
