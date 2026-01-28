@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "crowd-pilot-serializer"
+version = "0.1.0"
+description = "Python bindings for crowd-pilot serializer"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+manifest-path = "crates/pyo3/Cargo.toml"
+features = ["pyo3/extension-module"]

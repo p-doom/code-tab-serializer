@@ -49,7 +49,10 @@ pub use helpers::{
 };
 pub use yaml_types::{Cursor, State, Task, Terminal, find_changed_file, find_all_changed_files, is_eval_state, parse_yaml_task};
 pub use yaml_to_sed::{convert_yaml_to_testcases, yaml_to_testcases, TestCase, TestCaseMessage};
-pub use yaml_to_zeta::{convert_yaml_to_zeta, format_zeta_markdown, yaml_to_zeta_testcases, ZetaTestCase};
+pub use yaml_to_zeta::{
+    convert_yaml_to_zeta_eval, yaml_to_zeta_eval_testcases,
+    ZetaEvalTestCase, ZetaTestCaseMessage,
+};
 
 /// Default viewport radius (lines above/below cursor to show)
 pub const VIEWPORT_RADIUS: usize = 10;

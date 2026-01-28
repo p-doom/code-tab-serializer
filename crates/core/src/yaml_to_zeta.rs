@@ -1,6 +1,6 @@
 //! Convert YAML evals to Zeta's diff-based format with editable region markers.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diff::compute_changed_block_lines;
 use crate::yaml_types::{find_all_changed_files, has_terminal_command, is_eval_state, parse_yaml_task, State, Task};
@@ -15,6 +15,21 @@ pub struct ZetaTestCase {
     pub events: String,
     pub input: String,
     pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assertions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZetaTestCaseMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZetaEvalTestCase {
+    pub task_id: String,
+    pub context: Vec<ZetaTestCaseMessage>,
+    pub expected_final_response: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertions: Option<String>,
 }
@@ -214,4 +229,48 @@ pub fn format_zeta_markdown(tc: &ZetaTestCase) -> String {
 pub fn convert_yaml_to_zeta(yaml_content: &str) -> Result<Vec<ZetaTestCase>, String> {
     let task = parse_yaml_task(yaml_content)?;
     Ok(yaml_to_zeta_testcases(&task))
+}
+
+fn format_zeta_prompt(tc: &ZetaTestCase) -> String {
+    let parts = vec![
+        "<events>".to_string(),
+        tc.events.clone(),
+        "</events>".to_string(),
+        "".to_string(),
+        "<input>".to_string(),
+        tc.input.clone(),
+        "</input>".to_string(),
+    ];
+    parts.join("\n")
+}
+
+fn format_zeta_response(tc: &ZetaTestCase) -> String {
+    format!("<output>\n{}\n</output>", tc.output)
+}
+
+pub fn yaml_to_zeta_eval_testcases(task: &Task) -> Vec<ZetaEvalTestCase> {
+    let zeta_cases = yaml_to_zeta_testcases(task);
+    let mut eval_cases = Vec::new();
+
+    for (i, tc) in zeta_cases.iter().enumerate() {
+        let prompt = format_zeta_prompt(tc);
+        let response = format_zeta_response(tc);
+
+        eval_cases.push(ZetaEvalTestCase {
+            task_id: format!("{}/{}", task.task_id, i),
+            context: vec![ZetaTestCaseMessage {
+                role: "user".to_string(),
+                content: prompt,
+            }],
+            expected_final_response: response,
+            assertions: tc.assertions.clone(),
+        });
+    }
+
+    eval_cases
+}
+
+pub fn convert_yaml_to_zeta_eval(yaml_content: &str) -> Result<Vec<ZetaEvalTestCase>, String> {
+    let task = parse_yaml_task(yaml_content)?;
+    Ok(yaml_to_zeta_eval_testcases(&task))
 }
