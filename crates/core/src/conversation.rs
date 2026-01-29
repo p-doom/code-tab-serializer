@@ -620,6 +620,34 @@ where
         )));
     }
 
+    /// Set file state directly (for YAML adapter).
+    ///
+    /// This allows setting file content without providing incremental edit details.
+    /// The diff will be computed when the edit is flushed.
+    ///
+    /// For new files, call `handle_tab_event` first to show the initial content.
+    pub fn set_file_state(&mut self, file_path: &str, content: String) {
+        self.flush_terminal_output_buffer();
+
+        // If file already exists and content differs, set up pending edit
+        if let Some(old_content) = self.file_states.get(file_path) {
+            if old_content != &content {
+                // Only set pending_edits_before if not already tracking an edit
+                if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_none() {
+                    self.pending_edits_before
+                        .insert(file_path.to_string(), Some(old_content.clone()));
+                }
+            }
+        }
+
+        self.file_states.insert(file_path.to_string(), content);
+    }
+
+    /// Check if a file exists in the current state.
+    pub fn has_file(&self, file_path: &str) -> bool {
+        self.file_states.contains_key(file_path)
+    }
+
     /// Finalize and get conversation ready for model.
     pub fn finalize_for_model(&mut self) -> Vec<ConversationMessage> {
         self.flush_all_pending_edits();
