@@ -514,9 +514,24 @@ where
         self.flush_terminal_output_buffer();
 
         let content = self.file_states.get(file_path).cloned().unwrap_or_default();
-        let total_lines = content.split('\n').count();
         let safe_offset = floor_char_boundary(&content, offset.min(content.len()));
         let target_line = content[..safe_offset].matches('\n').count() + 1;
+
+        self.emit_viewport_for_line(file_path, target_line);
+    }
+
+    pub fn handle_cursor_by_line(&mut self, file_path: &str, line: usize) {
+        if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_some() {
+            return;
+        }
+
+        self.flush_terminal_output_buffer();
+        self.emit_viewport_for_line(file_path, line);
+    }
+
+    fn emit_viewport_for_line(&mut self, file_path: &str, target_line: usize) {
+        let content = self.file_states.get(file_path).cloned().unwrap_or_default();
+        let total_lines = content.split('\n').count();
 
         let current_vp = self.per_file_viewport.get(file_path).and_then(|v| *v);
         let mut should_emit = false;

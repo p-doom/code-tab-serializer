@@ -187,14 +187,26 @@ fn process_state_transition<T: Tokenizer>(
 
     let changed = find_changed_files(prev_files, curr_files);
 
-    for (file_path, old_content, new_content) in changed {
+    let mut new_files: Vec<&str> = Vec::new();
+
+    for (file_path, old_content, new_content) in &changed {
         if old_content.is_none() {
             // New file: show full content via tab event
             manager.handle_tab_event(file_path, Some(new_content));
+            new_files.push(file_path);
         } else {
             // Existing file changed: set new state, let flush compute diff
             manager.set_file_state(file_path, new_content.to_string());
             manager.flush_pending_edit_for_file(file_path);
+        }
+    }
+
+    if let Some(cursor) = &curr_state.cursor {
+        if let Some(file_path) = &cursor.file {
+            let file_was_new = new_files.iter().any(|p| *p == file_path);
+            if manager.has_file(file_path) && !file_was_new {
+                manager.handle_cursor_by_line(file_path, cursor.line);
+            }
         }
     }
 }
