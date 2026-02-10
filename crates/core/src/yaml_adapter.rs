@@ -297,7 +297,8 @@ states:
         let convs = process_yaml_task(&task, &CharApproxTokenizer, &config);
 
         // Should produce at least one conversation with messages
-        assert!(!convs.is_empty() || convs.iter().any(|c| !c.messages.is_empty()));
+        assert!(!convs.is_empty());
+        assert!(convs.iter().any(|c| !c.messages.is_empty()));
     }
 
     #[test]

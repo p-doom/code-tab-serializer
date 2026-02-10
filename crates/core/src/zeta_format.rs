@@ -112,6 +112,26 @@ fn line_token_guess(line: &str) -> usize {
     std::cmp::max(1, bytes / BYTES_PER_TOKEN_GUESS)
 }
 
+/// Clamp to the nearest valid UTF-8 char boundary at or before `idx`.
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Insert cursor marker using a UTF-8-safe index.
+fn insert_cursor_marker(line: &str, cursor_column: usize) -> String {
+    let char_idx = floor_char_boundary(line, cursor_column);
+    format!(
+        "{}{}{}",
+        &line[..char_idx],
+        USER_CURSOR_MARKER,
+        &line[char_idx..]
+    )
+}
+
 /// Expand a line range within token budget.
 fn expand_line_range(lines: &[&str], base: LineRange, token_limit: usize) -> LineRange {
     let mut start = base.start.min(lines.len().saturating_sub(1));
@@ -155,14 +175,34 @@ pub fn compute_editable_and_context_ranges(
     lines: &[&str],
     cursor_line: usize,
 ) -> (LineRange, LineRange) {
+    compute_editable_and_context_ranges_with_limits(
+        lines,
+        cursor_line,
+        MAX_EDITABLE_TOKENS,
+        MAX_CONTEXT_TOKENS,
+    )
+}
+
+/// Compute editable and context ranges with caller-provided token budgets.
+fn compute_editable_and_context_ranges_with_limits(
+    lines: &[&str],
+    cursor_line: usize,
+    max_editable_tokens: usize,
+    max_context_tokens: usize,
+) -> (LineRange, LineRange) {
+    if lines.is_empty() {
+        let empty = LineRange { start: 0, end: 0 };
+        return (empty, empty);
+    }
+
     let clamped = cursor_line.min(lines.len().saturating_sub(1));
     let cursor_range = LineRange {
         start: clamped,
         end: clamped,
     };
 
-    let editable = expand_line_range(lines, cursor_range, MAX_EDITABLE_TOKENS);
-    let context = expand_line_range(lines, editable, MAX_CONTEXT_TOKENS);
+    let editable = expand_line_range(lines, cursor_range, max_editable_tokens);
+    let context = expand_line_range(lines, editable, max_context_tokens);
 
     (editable, context)
 }
@@ -177,6 +217,14 @@ pub fn format_cursor_excerpt(
     cursor_column: usize,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
+
+    if lines.is_empty() {
+        return format!(
+            "`````{}\n{}\n{}\n{}\n`````",
+            file_path, EDITABLE_REGION_START, USER_CURSOR_MARKER, EDITABLE_REGION_END
+        );
+    }
+
     let context_start = context.start.min(lines.len().saturating_sub(1));
     let context_end = context.end.min(lines.len().saturating_sub(1));
 
@@ -186,18 +234,11 @@ pub fn format_cursor_excerpt(
         .collect();
 
     // Insert cursor marker
-    let cursor_index = cursor_line.saturating_sub(context_start);
-    if cursor_index < excerpt_lines.len() {
-        let line = &excerpt_lines[cursor_index];
-        let char_idx = cursor_column.min(line.len());
-        let new_line = format!(
-            "{}{}{}",
-            &line[..char_idx],
-            USER_CURSOR_MARKER,
-            &line[char_idx..]
-        );
-        excerpt_lines[cursor_index] = new_line;
-    }
+    let cursor_index = cursor_line
+        .saturating_sub(context_start)
+        .min(excerpt_lines.len().saturating_sub(1));
+    let line = &excerpt_lines[cursor_index];
+    excerpt_lines[cursor_index] = insert_cursor_marker(line, cursor_column);
 
     // Insert editable region markers
     let editable_start_idx = editable.start.saturating_sub(context_start);
@@ -284,20 +325,25 @@ pub struct ZetaConversation {
 pub fn process_yaml_task_zeta<T: crate::Tokenizer>(
     task: &Task,
     tokenizer: &T,
-    _config: &ZetaConfig,
+    config: &ZetaConfig,
 ) -> Vec<ZetaConversation> {
     let mut conversations = Vec::new();
     let mut edit_history: Vec<EditHistoryEntry> = Vec::new();
     let mut prev_files: HashMap<String, String> = HashMap::new();
 
-    for (state_idx, state) in task.states.iter().enumerate() {
+    for state in &task.states {
+        let edit_history_len_before_state = edit_history.len();
+
         // Track file changes as edit history
         if let Some(curr_files) = &state.files {
             for (path, new_content) in curr_files {
                 if let Some(old_content) = prev_files.get(path) {
                     if old_content != new_content {
-                        let diff =
-                            compute_unified_diff(old_content, new_content, DIFF_CONTEXT_LINES);
+                        let diff = compute_unified_diff(
+                            old_content,
+                            new_content,
+                            config.diff_context_lines,
+                        );
                         if !diff.is_empty() {
                             edit_history.push(EditHistoryEntry {
                                 old_path: path.clone(),
@@ -342,8 +388,9 @@ pub fn process_yaml_task_zeta<T: crate::Tokenizer>(
                             content,
                             cursor_line,
                             cursor_col,
-                            &edit_history[..edit_history.len().saturating_sub(1)], // Exclude current edit
+                            &edit_history[..edit_history_len_before_state],
                             tokenizer,
+                            config,
                         );
 
                         conversations.push(conv);
@@ -370,14 +417,26 @@ fn build_zeta_conversation<T: crate::Tokenizer>(
     cursor_col: usize,
     edit_history: &[EditHistoryEntry],
     tokenizer: &T,
+    config: &ZetaConfig,
 ) -> ZetaConversation {
     let lines: Vec<&str> = input_content.lines().collect();
-    let (editable, context) = compute_editable_and_context_ranges(&lines, cursor_line);
+    let (editable, context) = compute_editable_and_context_ranges_with_limits(
+        &lines,
+        cursor_line,
+        config.max_editable_tokens,
+        config.max_context_tokens,
+    );
 
     // Build system prompt with context
     let edit_history_text = format_edit_history(edit_history);
-    let cursor_excerpt =
-        format_cursor_excerpt(file_path, input_content, editable, context, cursor_line, cursor_col);
+    let cursor_excerpt = format_cursor_excerpt(
+        file_path,
+        input_content,
+        editable,
+        context,
+        cursor_line,
+        cursor_col,
+    );
 
     let system_content = format!(
         "{}\n\n# 1. User Edits History\n\n`````\n{}\n`````\n\n# 2. Related excerpts\n\n(No context)\n\n# 3. Current File\n\n{}",
@@ -386,11 +445,38 @@ fn build_zeta_conversation<T: crate::Tokenizer>(
         cursor_excerpt
     );
 
-    // Build expected output
+    // Build expected output with editable region markers and cursor marker
     let expected_lines: Vec<&str> = expected_content.lines().collect();
-    let editable_start = editable.start.min(expected_lines.len().saturating_sub(1));
-    let editable_end = editable.end.min(expected_lines.len().saturating_sub(1));
-    let expected_editable: String = expected_lines[editable_start..=editable_end].join("\n");
+    let expected_editable = if expected_lines.is_empty() {
+        // Empty content: just include cursor marker between region markers
+        format!(
+            "{}\n{}\n{}",
+            EDITABLE_REGION_START, USER_CURSOR_MARKER, EDITABLE_REGION_END
+        )
+    } else {
+        let editable_start = editable.start.min(expected_lines.len().saturating_sub(1));
+        let editable_end = editable.end.min(expected_lines.len().saturating_sub(1));
+        let mut editable_region_lines: Vec<String> = expected_lines[editable_start..=editable_end]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Insert cursor marker at the appropriate position within the editable region
+        if !editable_region_lines.is_empty() {
+            let cursor_index = cursor_line
+                .saturating_sub(editable_start)
+                .min(editable_region_lines.len().saturating_sub(1));
+            let line = &editable_region_lines[cursor_index];
+            editable_region_lines[cursor_index] = insert_cursor_marker(line, cursor_col);
+        }
+
+        format!(
+            "{}\n{}\n{}",
+            EDITABLE_REGION_START,
+            editable_region_lines.join("\n"),
+            EDITABLE_REGION_END
+        )
+    };
 
     let expected_output = format!(
         "Based on the edit history and cursor position, here's the predicted edit:\n\n`````\n{}\n`````",
@@ -408,7 +494,8 @@ fn build_zeta_conversation<T: crate::Tokenizer>(
         },
     ];
 
-    let token_count = tokenizer.count_tokens(&system_content) + tokenizer.count_tokens(&expected_output);
+    let token_count =
+        tokenizer.count_tokens(&system_content) + tokenizer.count_tokens(&expected_output);
 
     ZetaConversation {
         messages,
@@ -463,6 +550,43 @@ mod tests {
         assert!(result.contains(EDITABLE_REGION_START));
         assert!(result.contains(EDITABLE_REGION_END));
         assert!(result.contains(USER_CURSOR_MARKER));
+    }
+
+    #[test]
+    fn test_format_cursor_excerpt_empty_content() {
+        let result = format_cursor_excerpt(
+            "empty.py",
+            "",
+            LineRange { start: 0, end: 0 },
+            LineRange { start: 0, end: 0 },
+            0,
+            0,
+        );
+
+        assert!(result.contains(EDITABLE_REGION_START));
+        assert!(result.contains(EDITABLE_REGION_END));
+        assert!(result.contains(USER_CURSOR_MARKER));
+    }
+
+    #[test]
+    fn test_format_cursor_excerpt_utf8_cursor_column() {
+        let content = "héllo\nline2";
+        let editable = LineRange { start: 0, end: 1 };
+        let context = LineRange { start: 0, end: 1 };
+
+        let result = format_cursor_excerpt("utf8.py", content, editable, context, 0, 2);
+        assert!(result.contains("h<|user_cursor|>éllo"));
+    }
+
+    #[test]
+    fn test_compute_editable_range_respects_config_limits() {
+        let lines: Vec<&str> = (0..20).map(|_| "abcdefghij").collect();
+        let (default_editable, _) = compute_editable_and_context_ranges(&lines, 10);
+        let (small_editable, _) = compute_editable_and_context_ranges_with_limits(&lines, 10, 1, 1);
+
+        let default_width = default_editable.end.saturating_sub(default_editable.start);
+        let small_width = small_editable.end.saturating_sub(small_editable.start);
+        assert!(small_width <= default_width);
     }
 
     #[test]
