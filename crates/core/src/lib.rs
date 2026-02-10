@@ -33,16 +33,29 @@ mod conversation;
 mod diff;
 mod helpers;
 pub mod pipeline;
+pub mod yaml_adapter;
+pub mod zeta_format;
 
 pub use conversation::{ConversationMessage, ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
 pub use pipeline::{
     discover_csv_files, process_all_sessions, process_session, write_jsonl_output,
     MilesMessage, MilesRecord, PipelineConfig, PipelineResult, SessionResult,
 };
-pub use diff::{compute_changed_block_lines, ChangedBlock};
+pub use diff::{compute_changed_block_lines, compute_unified_diff, ChangedBlock};
 pub use helpers::{
     apply_backspaces, apply_change, clean_text, escape_single_quotes_for_sed, fenced_block,
     line_numbered_output, normalize_terminal_output, serialize_compute_viewport, Viewport,
+};
+pub use yaml_adapter::{
+    convert_yaml_to_conversations, parse_yaml_task, process_yaml_task,
+    Cursor, State, Task, Terminal, YamlProcessingConfig,
+    find_changed_files, has_terminal_command, is_eval_state,
+};
+pub use zeta_format::{
+    convert_yaml_to_zeta, process_yaml_task_zeta, zeta_system_prompt,
+    ZetaConfig, ZetaConversation, LineRange,
+    compute_editable_and_context_ranges, format_cursor_excerpt,
+    format_edit_history, EditHistoryEntry,
 };
 
 /// Default viewport radius (lines above/below cursor to show)

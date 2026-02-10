@@ -514,9 +514,24 @@ where
         self.flush_terminal_output_buffer();
 
         let content = self.file_states.get(file_path).cloned().unwrap_or_default();
-        let total_lines = content.split('\n').count();
         let safe_offset = floor_char_boundary(&content, offset.min(content.len()));
         let target_line = content[..safe_offset].matches('\n').count() + 1;
+
+        self.emit_viewport_for_line(file_path, target_line);
+    }
+
+    pub fn handle_cursor_by_line(&mut self, file_path: &str, line: usize) {
+        if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_some() {
+            return;
+        }
+
+        self.flush_terminal_output_buffer();
+        self.emit_viewport_for_line(file_path, line);
+    }
+
+    fn emit_viewport_for_line(&mut self, file_path: &str, target_line: usize) {
+        let content = self.file_states.get(file_path).cloned().unwrap_or_default();
+        let total_lines = content.split('\n').count();
 
         let current_vp = self.per_file_viewport.get(file_path).and_then(|v| *v);
         let mut should_emit = false;
@@ -618,6 +633,34 @@ where
             Some("bash"),
             &clean_text(&cmd),
         )));
+    }
+
+    /// Set file state directly (for YAML adapter).
+    ///
+    /// This allows setting file content without providing incremental edit details.
+    /// The diff will be computed when the edit is flushed.
+    ///
+    /// For new files, call `handle_tab_event` first to show the initial content.
+    pub fn set_file_state(&mut self, file_path: &str, content: String) {
+        self.flush_terminal_output_buffer();
+
+        // If file already exists and content differs, set up pending edit
+        if let Some(old_content) = self.file_states.get(file_path) {
+            if old_content != &content {
+                // Only set pending_edits_before if not already tracking an edit
+                if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_none() {
+                    self.pending_edits_before
+                        .insert(file_path.to_string(), Some(old_content.clone()));
+                }
+            }
+        }
+
+        self.file_states.insert(file_path.to_string(), content);
+    }
+
+    /// Check if a file exists in the current state.
+    pub fn has_file(&self, file_path: &str) -> bool {
+        self.file_states.contains_key(file_path)
     }
 
     /// Finalize and get conversation ready for model.

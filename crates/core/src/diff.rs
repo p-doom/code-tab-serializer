@@ -210,6 +210,116 @@ impl<'a> SequenceMatcher<'a> {
     }
 }
 
+/// Compute a unified diff between two strings with context lines.
+///
+/// Returns a string in unified diff format (without the file headers).
+pub fn compute_unified_diff(old_content: &str, new_content: &str, context_lines: usize) -> String {
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+
+    if old_lines == new_lines {
+        return String::new();
+    }
+
+    let sm = SequenceMatcher::new(old_lines.clone(), new_lines.clone());
+    let opcodes = sm.get_opcodes();
+
+    // Group opcodes into hunks with context
+    let mut hunks: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < opcodes.len() {
+        // Skip leading equal blocks
+        if opcodes[i].0 == OpcodeTag::Equal {
+            i += 1;
+            continue;
+        }
+
+        // Find hunk boundaries
+        let mut hunk_start_i = i;
+        let mut hunk_end_i = i;
+
+        // Look for a contiguous group of changes (with context overlap)
+        while hunk_end_i < opcodes.len() {
+            if opcodes[hunk_end_i].0 == OpcodeTag::Equal {
+                // Check if next non-equal is within context range
+                let equal_len = opcodes[hunk_end_i].2 - opcodes[hunk_end_i].1;
+                if equal_len > context_lines * 2 {
+                    break;
+                }
+            }
+            hunk_end_i += 1;
+        }
+
+        // Build hunk
+        let first_op = &opcodes[hunk_start_i];
+        let last_op = &opcodes[hunk_end_i.saturating_sub(1).max(hunk_start_i)];
+
+        // Calculate context bounds
+        let old_start = first_op.1.saturating_sub(context_lines);
+        let old_end = (last_op.2 + context_lines).min(old_lines.len());
+        let new_start = first_op.3.saturating_sub(context_lines);
+        let new_end = (last_op.4 + context_lines).min(new_lines.len());
+
+        let old_len = old_end - old_start;
+        let new_len = new_end - new_start;
+
+        let mut hunk_lines: Vec<String> = Vec::new();
+        hunk_lines.push(format!(
+            "@@ -{},{} +{},{} @@",
+            old_start + 1,
+            old_len,
+            new_start + 1,
+            new_len
+        ));
+
+        // Add context before
+        for line in old_lines.iter().take(first_op.1).skip(old_start) {
+            hunk_lines.push(format!(" {}", line));
+        }
+
+        // Add changes
+        for op_idx in hunk_start_i..hunk_end_i {
+            let op = &opcodes[op_idx];
+            match op.0 {
+                OpcodeTag::Replace => {
+                    for line in old_lines.iter().take(op.2).skip(op.1) {
+                        hunk_lines.push(format!("-{}", line));
+                    }
+                    for line in new_lines.iter().take(op.4).skip(op.3) {
+                        hunk_lines.push(format!("+{}", line));
+                    }
+                }
+                OpcodeTag::Delete => {
+                    for line in old_lines.iter().take(op.2).skip(op.1) {
+                        hunk_lines.push(format!("-{}", line));
+                    }
+                }
+                OpcodeTag::Insert => {
+                    for line in new_lines.iter().take(op.4).skip(op.3) {
+                        hunk_lines.push(format!("+{}", line));
+                    }
+                }
+                OpcodeTag::Equal => {
+                    for line in old_lines.iter().take(op.2).skip(op.1) {
+                        hunk_lines.push(format!(" {}", line));
+                    }
+                }
+            }
+        }
+
+        // Add context after
+        for line in old_lines.iter().take(old_end).skip(last_op.2) {
+            hunk_lines.push(format!(" {}", line));
+        }
+
+        hunks.push(hunk_lines.join("\n"));
+        i = hunk_end_i;
+    }
+
+    hunks.join("\n")
+}
+
 /// Compute the changed block between two strings.
 ///
 /// Returns 1-based line numbers for the changed region and the replacement lines.
