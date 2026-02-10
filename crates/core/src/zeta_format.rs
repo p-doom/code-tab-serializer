@@ -6,10 +6,11 @@
 //! - Uses token budget for region expansion
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::conversation::{ConversationMessage, Role};
 use crate::diff::compute_unified_diff;
-use crate::yaml_adapter::Task;
+use crate::yaml_adapter::{State, Task};
 
 // Constants from the extension
 const BYTES_PER_TOKEN_GUESS: usize = 3;
@@ -296,6 +297,9 @@ pub struct ZetaConfig {
     pub max_editable_tokens: usize,
     pub max_context_tokens: usize,
     pub diff_context_lines: usize,
+    pub special_tokens_per_user_message: usize,
+    pub special_tokens_per_assistant_message: usize,
+    pub conversation_start_tokens: usize,
 }
 
 impl Default for ZetaConfig {
@@ -304,6 +308,9 @@ impl Default for ZetaConfig {
             max_editable_tokens: MAX_EDITABLE_TOKENS,
             max_context_tokens: MAX_CONTEXT_TOKENS,
             diff_context_lines: DIFF_CONTEXT_LINES,
+            special_tokens_per_user_message: 0,
+            special_tokens_per_assistant_message: 0,
+            conversation_start_tokens: 0,
         }
     }
 }
@@ -316,96 +323,146 @@ pub struct ZetaConversation {
     pub editable_range: LineRange,
 }
 
-/// Process YAML task to Zeta format conversations.
-///
-/// For each EVAL state, generates a conversation with:
-/// - Edit history as diffs leading up to that point
-/// - Current file with editable region around cursor
-/// - Expected output (edited editable region)
-pub fn process_yaml_task_zeta<T: crate::Tokenizer>(
+/// Sampling policy when generating Zeta examples from task states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZetaSamplingMode {
+    /// Emit examples only for states tagged with `eval: EVAL`.
+    EvalOnly,
+    /// Emit examples for every state transition.
+    EveryTransition,
+}
+
+fn should_sample_state(state: &State, state_idx: usize, mode: ZetaSamplingMode) -> bool {
+    match mode {
+        ZetaSamplingMode::EvalOnly => state.eval_tag.as_deref() == Some("EVAL"),
+        ZetaSamplingMode::EveryTransition => state_idx > 0,
+    }
+}
+
+fn compute_state_diffs(
+    prev_files: &HashMap<String, String>,
+    curr_files: &HashMap<String, String>,
+    diff_context_lines: usize,
+) -> Vec<EditHistoryEntry> {
+    let mut diffs = Vec::new();
+    for (path, new_content) in curr_files {
+        if let Some(old_content) = prev_files.get(path) {
+            if old_content != new_content {
+                let diff = compute_unified_diff(old_content, new_content, diff_context_lines);
+                if !diff.is_empty() {
+                    diffs.push(EditHistoryEntry {
+                        old_path: path.clone(),
+                        new_path: path.clone(),
+                        diff,
+                    });
+                }
+            }
+        }
+    }
+    diffs
+}
+
+fn message_overhead_tokens(role: Role, config: &ZetaConfig) -> usize {
+    match role {
+        Role::Assistant => config.special_tokens_per_assistant_message,
+        Role::System | Role::User => config.special_tokens_per_user_message,
+    }
+}
+
+/// Process task states to Zeta format conversations.
+pub fn process_task_zeta<T: crate::Tokenizer>(
     task: &Task,
     tokenizer: &T,
     config: &ZetaConfig,
-) -> Vec<ZetaConversation> {
+    sampling_mode: ZetaSamplingMode,
+) -> Result<Vec<ZetaConversation>, String> {
     let mut conversations = Vec::new();
     let mut edit_history: Vec<EditHistoryEntry> = Vec::new();
     let mut prev_files: HashMap<String, String> = HashMap::new();
 
-    for state in &task.states {
-        let edit_history_len_before_state = edit_history.len();
+    for (state_idx, state) in task.states.iter().enumerate() {
+        let curr_files_opt = state.files.as_ref();
+        let state_diffs = curr_files_opt
+            .map(|curr_files| {
+                compute_state_diffs(&prev_files, curr_files, config.diff_context_lines)
+            })
+            .unwrap_or_default();
 
-        // Track file changes as edit history
-        if let Some(curr_files) = &state.files {
-            for (path, new_content) in curr_files {
-                if let Some(old_content) = prev_files.get(path) {
-                    if old_content != new_content {
-                        let diff = compute_unified_diff(
-                            old_content,
-                            new_content,
-                            config.diff_context_lines,
-                        );
-                        if !diff.is_empty() {
-                            edit_history.push(EditHistoryEntry {
-                                old_path: path.clone(),
-                                new_path: path.clone(),
-                                diff,
-                            });
-                        }
-                    }
-                }
+        if should_sample_state(state, state_idx, sampling_mode) {
+            let curr_files = curr_files_opt.ok_or_else(|| {
+                format!(
+                    "State {} in task '{}' is missing files required for Zeta sampling",
+                    state_idx, task.task_id
+                )
+            })?;
+
+            let cursor = state.cursor.as_ref().ok_or_else(|| {
+                format!(
+                    "State {} in task '{}' is missing cursor required for Zeta sampling",
+                    state_idx, task.task_id
+                )
+            })?;
+
+            let cursor_file = cursor.file.as_ref().ok_or_else(|| {
+                format!(
+                    "State {} in task '{}' has cursor position but missing cursor.file",
+                    state_idx, task.task_id
+                )
+            })?;
+
+            if cursor.line == 0 {
+                return Err(format!(
+                    "State {} in task '{}' has invalid cursor.line=0; cursor lines must be 1-based",
+                    state_idx, task.task_id
+                ));
             }
 
-            // Check if this is an EVAL state
-            if state
-                .eval_tag
-                .as_ref()
-                .map(|t| t == "EVAL")
-                .unwrap_or(false)
-            {
-                // Find the current file and cursor
-                let cursor = state.cursor.as_ref();
-                let cursor_file = cursor.and_then(|c| c.file.as_ref());
+            let expected_content = curr_files.get(cursor_file).ok_or_else(|| {
+                format!(
+                    "State {} in task '{}' references cursor.file '{}' that is not present in files",
+                    state_idx, task.task_id, cursor_file
+                )
+            })?;
 
-                // Find the file to edit
-                let edit_file = cursor_file
-                    .map(|s| s.as_str())
-                    .or_else(|| curr_files.keys().next().map(|s| s.as_str()));
+            let input_content = prev_files
+                .get(cursor_file)
+                .map(|s| s.as_str())
+                .unwrap_or(expected_content);
 
-                if let Some(file_path) = edit_file {
-                    if let Some(content) = curr_files.get(file_path) {
-                        // Get previous content for expected output
-                        let prev_content = prev_files.get(file_path);
+            let conv = build_zeta_conversation(
+                cursor_file,
+                input_content,
+                expected_content,
+                cursor.line,
+                cursor.column,
+                &edit_history,
+                tokenizer,
+                config,
+            );
+            conversations.push(conv);
+        }
 
-                        let cursor_line = cursor.map(|c| c.line).unwrap_or(0);
-                        let cursor_col = cursor.map(|c| c.column).unwrap_or(0);
+        edit_history.extend(state_diffs);
 
-                        // Use prev_content for input, curr_content for expected output
-                        let input_content = prev_content.map(|s| s.as_str()).unwrap_or(content);
-
-                        let conv = build_zeta_conversation(
-                            file_path,
-                            input_content,
-                            content,
-                            cursor_line,
-                            cursor_col,
-                            &edit_history[..edit_history_len_before_state],
-                            tokenizer,
-                            config,
-                        );
-
-                        conversations.push(conv);
-                    }
-                }
-            }
-
-            // Update prev_files
+        if let Some(curr_files) = curr_files_opt {
             for (path, content) in curr_files {
                 prev_files.insert(path.clone(), content.clone());
             }
         }
     }
 
-    conversations
+    Ok(conversations)
+}
+
+/// Process YAML task to Zeta format conversations.
+///
+/// Emits examples only for `eval: EVAL` states.
+pub fn process_yaml_task_zeta<T: crate::Tokenizer>(
+    task: &Task,
+    tokenizer: &T,
+    config: &ZetaConfig,
+) -> Result<Vec<ZetaConversation>, String> {
+    process_task_zeta(task, tokenizer, config, ZetaSamplingMode::EvalOnly)
 }
 
 /// Build a Zeta conversation for a single EVAL point.
@@ -413,12 +470,13 @@ fn build_zeta_conversation<T: crate::Tokenizer>(
     file_path: &str,
     input_content: &str,
     expected_content: &str,
-    cursor_line: usize,
+    cursor_line_one_based: usize,
     cursor_col: usize,
     edit_history: &[EditHistoryEntry],
     tokenizer: &T,
     config: &ZetaConfig,
 ) -> ZetaConversation {
+    let cursor_line = cursor_line_one_based.saturating_sub(1);
     let lines: Vec<&str> = input_content.lines().collect();
     let (editable, context) = compute_editable_and_context_ranges_with_limits(
         &lines,
@@ -494,8 +552,14 @@ fn build_zeta_conversation<T: crate::Tokenizer>(
         },
     ];
 
-    let token_count =
-        tokenizer.count_tokens(&system_content) + tokenizer.count_tokens(&expected_output);
+    let token_count = config.conversation_start_tokens
+        + messages
+            .iter()
+            .map(|message| {
+                tokenizer.count_tokens(&message.content)
+                    + message_overhead_tokens(message.role, config)
+            })
+            .sum::<usize>();
 
     ZetaConversation {
         messages,
@@ -511,7 +575,25 @@ pub fn convert_yaml_to_zeta<T: crate::Tokenizer>(
     config: &ZetaConfig,
 ) -> Result<Vec<ZetaConversation>, String> {
     let task = crate::yaml_adapter::parse_yaml_task(yaml_content)?;
-    Ok(process_yaml_task_zeta(&task, tokenizer, config))
+    process_yaml_task_zeta(&task, tokenizer, config)
+}
+
+/// Convert one CSV session file to Zeta format conversations.
+///
+/// CSV transitions are sampled on every transition.
+pub fn convert_csv_to_zeta_session<T: crate::Tokenizer>(
+    csv_path: &Path,
+    tokenizer: &T,
+    coalesce_radius: usize,
+    config: &ZetaConfig,
+) -> Result<Vec<ZetaConversation>, String> {
+    let task = crate::csv_adapter::csv_session_to_task(csv_path, coalesce_radius).map_err(|e| {
+        format!(
+            "Failed to convert CSV session {:?} to task: {}",
+            csv_path, e
+        )
+    })?;
+    process_task_zeta(&task, tokenizer, config, ZetaSamplingMode::EveryTransition)
 }
 
 #[cfg(test)]
@@ -620,5 +702,149 @@ states:
 
         assert!(!convs.is_empty());
         assert!(!convs[0].messages.is_empty());
+    }
+
+    #[test]
+    fn test_process_task_zeta_every_transition_ignores_eval_tag() {
+        let yaml = r#"
+task_id: transition_sampling
+states:
+  - step: 0
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 1
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+  - step: 1
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 2
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+  - step: 2
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 3
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+"#;
+        let task = crate::yaml_adapter::parse_yaml_task(yaml).unwrap();
+        let convs = process_task_zeta(
+            &task,
+            &CharTokenizer,
+            &ZetaConfig::default(),
+            ZetaSamplingMode::EveryTransition,
+        )
+        .unwrap();
+        assert_eq!(convs.len(), 2);
+    }
+
+    #[test]
+    fn test_process_task_zeta_errors_on_missing_cursor_file() {
+        let yaml = r#"
+task_id: missing_cursor_file
+states:
+  - step: 0
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 1
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+  - step: 1
+    eval: EVAL
+    files:
+      test.py: |
+        a = 2
+    cursor:
+      line: 1
+      column: 0
+"#;
+        let task = crate::yaml_adapter::parse_yaml_task(yaml).unwrap();
+        let err = process_yaml_task_zeta(&task, &CharTokenizer, &ZetaConfig::default())
+            .expect_err("expected strict cursor.file validation error");
+        assert!(err.contains("missing cursor.file"));
+    }
+
+    #[test]
+    fn test_process_task_zeta_errors_on_non_one_based_line() {
+        let yaml = r#"
+task_id: bad_cursor_line
+states:
+  - step: 0
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 1
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+  - step: 1
+    eval: EVAL
+    files:
+      test.py: |
+        a = 2
+    cursor:
+      file: test.py
+      line: 0
+      column: 0
+"#;
+        let task = crate::yaml_adapter::parse_yaml_task(yaml).unwrap();
+        let err = process_yaml_task_zeta(&task, &CharTokenizer, &ZetaConfig::default())
+            .expect_err("expected one-based cursor line validation error");
+        assert!(err.contains("1-based"));
+    }
+
+    #[test]
+    fn test_zeta_token_count_includes_chat_template_overhead() {
+        let yaml = r#"
+task_id: zeta_template_tokens
+states:
+  - step: 0
+    eval: NO_EVAL
+    files:
+      test.py: |
+        a = 1
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+  - step: 1
+    eval: EVAL
+    files:
+      test.py: |
+        a = 2
+    cursor:
+      file: test.py
+      line: 1
+      column: 0
+"#;
+        let task = crate::yaml_adapter::parse_yaml_task(yaml).unwrap();
+
+        let base = process_yaml_task_zeta(&task, &CharTokenizer, &ZetaConfig::default()).unwrap();
+
+        let mut with_template = ZetaConfig::default();
+        with_template.special_tokens_per_user_message = 5;
+        with_template.special_tokens_per_assistant_message = 9;
+        with_template.conversation_start_tokens = 2;
+        let with_template = process_yaml_task_zeta(&task, &CharTokenizer, &with_template).unwrap();
+
+        assert_eq!(base.len(), 1);
+        assert_eq!(with_template.len(), 1);
+        assert_eq!(with_template[0].messages.len(), 2);
+        assert_eq!(base[0].messages.len(), 2);
+        assert_eq!(with_template[0].token_count, base[0].token_count + 16);
     }
 }

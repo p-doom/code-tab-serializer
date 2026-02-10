@@ -5,14 +5,14 @@
 //! suitable for training language models.
 
 /// Trait for tokenization operations.
-/// 
+///
 /// Implementors provide token counting and truncation capabilities.
 /// For exact tokenization (preprocessing), use a real tokenizer.
 /// For approximate tokenization (runtime), use character-based estimation.
 pub trait Tokenizer {
     /// Count the number of tokens in the given text.
     fn count_tokens(&self, text: &str) -> usize;
-    
+
     /// Truncate text to at most `max_tokens` tokens.
     /// Returns the truncated text.
     fn truncate_to_max_tokens(&self, text: &str, max_tokens: usize) -> String;
@@ -23,39 +23,46 @@ impl<T: Tokenizer + ?Sized> Tokenizer for &T {
     fn count_tokens(&self, text: &str) -> usize {
         (*self).count_tokens(text)
     }
-    
+
     fn truncate_to_max_tokens(&self, text: &str, max_tokens: usize) -> String {
         (*self).truncate_to_max_tokens(text, max_tokens)
     }
 }
 
 mod conversation;
+pub mod csv_adapter;
 mod diff;
 mod helpers;
 pub mod pipeline;
 pub mod yaml_adapter;
 pub mod zeta_format;
 
-pub use conversation::{ConversationMessage, ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
-pub use pipeline::{
-    discover_csv_files, process_all_sessions, process_session, write_jsonl_output,
-    MilesMessage, MilesRecord, PipelineConfig, PipelineResult, SessionResult,
+pub use conversation::{
+    ConversationMessage, ConversationStateManager, ConversationStateManagerConfig,
+    FinalizedConversation, Role,
+};
+pub use csv_adapter::{
+    coalesce_csv_events, coalesced_events_to_task, csv_session_to_task, offset_to_line_column,
+    parse_and_coalesce_csv_session, parse_csv_session, CoalescedCsvEvent, CsvRawEvent,
 };
 pub use diff::{compute_changed_block_lines, compute_unified_diff, ChangedBlock};
 pub use helpers::{
     apply_backspaces, apply_change, clean_text, escape_single_quotes_for_sed, fenced_block,
     line_numbered_output, normalize_terminal_output, serialize_compute_viewport, Viewport,
 };
+pub use pipeline::{
+    discover_csv_files, process_all_sessions, process_session, write_jsonl_output, MilesMessage,
+    MilesRecord, PipelineConfig, PipelineResult, SessionResult,
+};
 pub use yaml_adapter::{
-    convert_yaml_to_conversations, parse_yaml_task, process_yaml_task,
-    Cursor, State, Task, Terminal, YamlProcessingConfig,
-    find_changed_files, has_terminal_command, is_eval_state,
+    convert_yaml_to_conversations, find_changed_files, has_terminal_command, is_eval_state,
+    parse_yaml_task, process_yaml_task, Cursor, State, Task, Terminal, YamlProcessingConfig,
 };
 pub use zeta_format::{
-    convert_yaml_to_zeta, process_yaml_task_zeta, zeta_system_prompt,
-    ZetaConfig, ZetaConversation, LineRange,
-    compute_editable_and_context_ranges, format_cursor_excerpt,
-    format_edit_history, EditHistoryEntry,
+    compute_editable_and_context_ranges, convert_csv_to_zeta_session, convert_yaml_to_zeta,
+    format_cursor_excerpt, format_edit_history, process_task_zeta, process_yaml_task_zeta,
+    zeta_system_prompt, EditHistoryEntry, LineRange, ZetaConfig, ZetaConversation,
+    ZetaSamplingMode,
 };
 
 /// Default viewport radius (lines above/below cursor to show)
@@ -136,4 +143,3 @@ Do NOT emit commands like "3s/print/print()/g" or any other "s/old/new/" style s
 When you are NOT editing files (e.g., running tests, git commands, tools, etc.), you may emit arbitrary bash commands."#
     )
 }
-
