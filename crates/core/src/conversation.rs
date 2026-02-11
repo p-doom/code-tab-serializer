@@ -10,7 +10,9 @@ use crate::helpers::{
     line_numbered_output, normalize_terminal_output, serialize_compute_viewport, Viewport,
 };
 use crate::Tokenizer;
-use crate::{COALESCE_RADIUS, MAX_TOKENS_PER_MESSAGE, MAX_TOKENS_PER_TERMINAL_OUTPUT, VIEWPORT_RADIUS};
+use crate::{
+    COALESCE_RADIUS, MAX_TOKENS_PER_MESSAGE, MAX_TOKENS_PER_TERMINAL_OUTPUT, VIEWPORT_RADIUS,
+};
 
 /// Role in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +211,7 @@ where
         self.flush_all_pending_edits();
         self.flush_terminal_output_buffer();
         self.finalize_current_conversation();
-        
+
         std::mem::take(&mut self.finalized_conversations)
     }
 
@@ -228,12 +230,11 @@ where
     /// finalizes current conversation and starts a new one.
     fn append_message(&mut self, mut message: ConversationMessage) {
         let mut tokens = self.tokenizer.count_tokens(&message.content);
-        
+
         if tokens > self.config.max_tokens_per_message {
-            message.content = self.tokenizer.truncate_to_max_tokens(
-                &message.content,
-                self.config.max_tokens_per_message,
-            );
+            message.content = self
+                .tokenizer
+                .truncate_to_max_tokens(&message.content, self.config.max_tokens_per_message);
             tokens = self.config.max_tokens_per_message;
         }
 
@@ -246,7 +247,8 @@ where
 
         // Check if we need to start a new conversation (chunking mode)
         if let Some(max_tokens) = self.config.max_tokens_per_conversation {
-            if self.current_tokens + tokens_with_overhead > max_tokens && !self.messages.is_empty() {
+            if self.current_tokens + tokens_with_overhead > max_tokens && !self.messages.is_empty()
+            {
                 self.finalize_current_conversation();
                 // After starting a new conversation, we need to re-capture file states
                 // This will happen naturally as files are accessed
@@ -272,7 +274,8 @@ where
             "<stdout>\n{}\n</stdout>",
             output
         )));
-        self.files_opened_in_conversation.insert(file_path.to_string());
+        self.files_opened_in_conversation
+            .insert(file_path.to_string());
     }
 
     /// Flush buffered terminal output.
@@ -286,10 +289,9 @@ where
 
         let tokens = self.tokenizer.count_tokens(&cleaned);
         if tokens > self.config.max_tokens_per_terminal_output {
-            let truncated = self.tokenizer.truncate_to_max_tokens(
-                &cleaned,
-                self.config.max_tokens_per_terminal_output,
-            );
+            let truncated = self
+                .tokenizer
+                .truncate_to_max_tokens(&cleaned, self.config.max_tokens_per_terminal_output);
             cleaned = format!("{}\n... [truncated]", truncated);
         }
 
@@ -309,11 +311,17 @@ where
             _ => return,
         };
 
-        let after_state = self.file_states.get(target_file).cloned().unwrap_or_default();
+        let after_state = self
+            .file_states
+            .get(target_file)
+            .cloned()
+            .unwrap_or_default();
 
         if before_snapshot.trim_end_matches('\n') == after_state.trim_end_matches('\n') {
-            self.pending_edits_before.insert(target_file.to_string(), None);
-            self.pending_edit_regions.insert(target_file.to_string(), None);
+            self.pending_edits_before
+                .insert(target_file.to_string(), None);
+            self.pending_edit_regions
+                .insert(target_file.to_string(), None);
             return;
         }
 
@@ -382,8 +390,10 @@ where
             viewport_output
         )));
 
-        self.pending_edits_before.insert(target_file.to_string(), None);
-        self.pending_edit_regions.insert(target_file.to_string(), None);
+        self.pending_edits_before
+            .insert(target_file.to_string(), None);
+        self.pending_edit_regions
+            .insert(target_file.to_string(), None);
     }
 
     /// Flush all pending edits.
@@ -401,7 +411,8 @@ where
 
         if let Some(text) = text_content {
             let content = text.replace("\\n", "\n").replace("\\r", "\r");
-            self.file_states.insert(file_path.to_string(), content.clone());
+            self.file_states
+                .insert(file_path.to_string(), content.clone());
 
             let cmd = format!("cat -n {}", file_path);
             self.append_message(ConversationMessage::assistant(fenced_block(
@@ -413,7 +424,8 @@ where
                 "<stdout>\n{}\n</stdout>",
                 output
             )));
-            self.files_opened_in_conversation.insert(file_path.to_string());
+            self.files_opened_in_conversation
+                .insert(file_path.to_string());
         } else {
             // File switch without content snapshot: show current viewport only
             let content = self.file_states.get(file_path).cloned().unwrap_or_default();
@@ -424,8 +436,10 @@ where
                 .and_then(|v| *v)
                 .filter(|v| v.end > 0)
                 .unwrap_or_else(|| {
-                    let new_vp = serialize_compute_viewport(total_lines, 1, self.config.viewport_radius);
-                    self.per_file_viewport.insert(file_path.to_string(), Some(new_vp));
+                    let new_vp =
+                        serialize_compute_viewport(total_lines, 1, self.config.viewport_radius);
+                    self.per_file_viewport
+                        .insert(file_path.to_string(), Some(new_vp));
                     new_vp
                 });
 
@@ -480,7 +494,12 @@ where
 
         let after = crate::helpers::apply_change(&before, offset, length, new_text);
 
-        if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_none() {
+        if self
+            .pending_edits_before
+            .get(file_path)
+            .and_then(|v| v.as_ref())
+            .is_none()
+        {
             self.pending_edits_before
                 .insert(file_path.to_string(), Some(before));
         }
@@ -504,10 +523,39 @@ where
         self.file_states.insert(file_path.to_string(), after);
     }
 
+    /// Handle a pre-coalesced edit transition.
+    ///
+    /// This is used by the shared CSV coalescing layer so all CSV-derived
+    /// output formats can reuse the same edit-burst boundaries.
+    pub fn handle_coalesced_edit_event(&mut self, file_path: &str, before: &str, after: &str) {
+        self.flush_terminal_output_buffer();
+
+        if before.trim_end_matches('\n') == after.trim_end_matches('\n') {
+            self.file_states
+                .insert(file_path.to_string(), after.to_string());
+            return;
+        }
+
+        // Ensure the serializer computes the exact sed command from the supplied
+        // before/after snapshots.
+        self.file_states
+            .insert(file_path.to_string(), before.to_string());
+        self.pending_edits_before
+            .insert(file_path.to_string(), Some(before.to_string()));
+        self.file_states
+            .insert(file_path.to_string(), after.to_string());
+        self.flush_pending_edit_for_file(file_path);
+    }
+
     /// Handle a selection event.
     pub fn handle_selection_event(&mut self, file_path: &str, offset: usize) {
         // During an edit burst (pending edits), suppress viewport emissions
-        if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_some() {
+        if self
+            .pending_edits_before
+            .get(file_path)
+            .and_then(|v| v.as_ref())
+            .is_some()
+        {
             return;
         }
 
@@ -521,7 +569,12 @@ where
     }
 
     pub fn handle_cursor_by_line(&mut self, file_path: &str, line: usize) {
-        if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_some() {
+        if self
+            .pending_edits_before
+            .get(file_path)
+            .and_then(|v| v.as_ref())
+            .is_some()
+        {
             return;
         }
 
@@ -538,8 +591,11 @@ where
 
         let vp = if let Some(vp) = current_vp.filter(|v| v.end > 0) {
             if target_line < vp.start || target_line > vp.end {
-                let new_vp =
-                    serialize_compute_viewport(total_lines, target_line, self.config.viewport_radius);
+                let new_vp = serialize_compute_viewport(
+                    total_lines,
+                    target_line,
+                    self.config.viewport_radius,
+                );
                 self.per_file_viewport
                     .insert(file_path.to_string(), Some(new_vp));
                 should_emit = true;
@@ -648,7 +704,12 @@ where
         if let Some(old_content) = self.file_states.get(file_path) {
             if old_content != &content {
                 // Only set pending_edits_before if not already tracking an edit
-                if self.pending_edits_before.get(file_path).and_then(|v| v.as_ref()).is_none() {
+                if self
+                    .pending_edits_before
+                    .get(file_path)
+                    .and_then(|v| v.as_ref())
+                    .is_none()
+                {
                     self.pending_edits_before
                         .insert(file_path.to_string(), Some(old_content.clone()));
                 }
@@ -690,10 +751,15 @@ mod tests {
 
     #[test]
     fn test_basic_tab_event() {
-        let mut manager =
-            ConversationStateManager::new(CharApproxTokenizer, ConversationStateManagerConfig::default());
+        let mut manager = ConversationStateManager::new(
+            CharApproxTokenizer,
+            ConversationStateManagerConfig::default(),
+        );
 
-        manager.handle_tab_event("/test/file.rs", Some("fn main() {\n    println!(\"hello\");\n}"));
+        manager.handle_tab_event(
+            "/test/file.rs",
+            Some("fn main() {\n    println!(\"hello\");\n}"),
+        );
 
         let messages = manager.finalize_for_model();
         assert_eq!(messages.len(), 2);
@@ -705,8 +771,10 @@ mod tests {
 
     #[test]
     fn test_content_event() {
-        let mut manager =
-            ConversationStateManager::new(CharApproxTokenizer, ConversationStateManagerConfig::default());
+        let mut manager = ConversationStateManager::new(
+            CharApproxTokenizer,
+            ConversationStateManagerConfig::default(),
+        );
 
         manager.handle_tab_event("/test/file.rs", Some("line1\nline2\nline3"));
         manager.handle_content_event("/test/file.rs", 6, 5, "modified");
@@ -718,8 +786,10 @@ mod tests {
 
     #[test]
     fn test_terminal_command() {
-        let mut manager =
-            ConversationStateManager::new(CharApproxTokenizer, ConversationStateManagerConfig::default());
+        let mut manager = ConversationStateManager::new(
+            CharApproxTokenizer,
+            ConversationStateManagerConfig::default(),
+        );
 
         manager.handle_terminal_command_event("cargo build");
         manager.handle_terminal_output_event("Compiling...\n");
@@ -731,4 +801,3 @@ mod tests {
         assert!(messages[1].content.contains("Compiling"));
     }
 }
-

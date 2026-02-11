@@ -4,29 +4,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use walkdir::WalkDir;
 
-use crate::conversation::{ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role};
+use crate::conversation::{
+    ConversationStateManager, ConversationStateManagerConfig, FinalizedConversation, Role,
+};
+use crate::csv_adapter::{parse_and_coalesce_csv_session, CoalescedCsvEvent};
 use crate::Tokenizer;
-
-/// A row from the CSV file.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct CsvRow {
-    #[serde(rename = "Sequence")]
-    _sequence: Option<i64>,
-    #[serde(rename = "Time")]
-    _time: Option<String>,
-    file: String,
-    range_offset: Option<i64>,
-    range_length: Option<i64>,
-    text: Option<String>,
-    #[serde(rename = "Language")]
-    _language: Option<String>,
-    #[serde(rename = "Type")]
-    event_type: String,
-}
 
 /// Configuration for the pipeline.
 #[derive(Debug, Clone)]
@@ -129,52 +114,38 @@ where
     };
 
     let mut manager = ConversationStateManager::new(tokenizer, manager_config);
+    let events = parse_and_coalesce_csv_session(csv_path, config.coalesce_radius)?;
 
-    let mut reader = csv::Reader::from_path(csv_path)?;
-    
-    for result in reader.deserialize() {
-        let row: CsvRow = result?;
-        
-        match row.event_type.as_str() {
-            "tab" => {
-                manager.handle_tab_event(&row.file, row.text.as_deref());
+    for event in events {
+        match event {
+            CoalescedCsvEvent::Tab {
+                file_path,
+                text_content,
+            } => {
+                manager.handle_tab_event(&file_path, text_content.as_deref());
             }
-            "content" => {
-                let offset = row.range_offset.expect("content event missing RangeOffset") as usize;
-                let length = row.range_length.expect("content event missing RangeLength") as usize;
-                let text = row.text.as_deref().unwrap_or("");
-                manager.handle_content_event(&row.file, offset, length, text);
+            CoalescedCsvEvent::Edit {
+                file_path,
+                before,
+                after,
+                ..
+            } => {
+                manager.handle_coalesced_edit_event(&file_path, &before, &after);
             }
-            "selection_command" | "selection_mouse" | "selection_keyboard" => {
-                let offset = row.range_offset.expect("selection event missing RangeOffset") as usize;
-                manager.handle_selection_event(&row.file, offset);
+            CoalescedCsvEvent::Selection { file_path, offset } => {
+                manager.handle_selection_event(&file_path, offset);
             }
-            "terminal_command" => {
-                let command = row.text.as_deref().unwrap_or_else(|| {
-                    eprintln!("Warning: terminal_command event missing Text in {:?}", csv_path);
-                    ""
-                });
-                manager.handle_terminal_command_event(command);
+            CoalescedCsvEvent::TerminalCommand { command } => {
+                manager.handle_terminal_command_event(&command);
             }
-            "terminal_output" => {
-                let output = row.text.as_deref().unwrap_or_else(|| {
-                    eprintln!("Warning: terminal_output event missing Text in {:?}", csv_path);
-                    ""
-                });
-                manager.handle_terminal_output_event(output);
+            CoalescedCsvEvent::TerminalOutput { output } => {
+                manager.handle_terminal_output_event(&output);
             }
-            "terminal_focus" => {
+            CoalescedCsvEvent::TerminalFocus => {
                 manager.handle_terminal_focus_event();
             }
-            "git_branch_checkout" => {
-                let branch_info = row.text.as_deref().unwrap_or_else(|| {
-                    eprintln!("Warning: git_branch_checkout event missing Text in {:?}", csv_path);
-                    ""
-                });
-                manager.handle_git_branch_checkout_event(branch_info);
-            }
-            other => {
-                eprintln!("Warning: Unknown event type '{}' in {:?}", other, csv_path);
+            CoalescedCsvEvent::GitBranchCheckout { branch_info } => {
+                manager.handle_git_branch_checkout_event(&branch_info);
             }
         }
     }
@@ -255,7 +226,9 @@ pub fn write_jsonl_output(
     sessions.sort_by(|(i, a), (j, b)| {
         let hash_a = (i * 2654435761) % 1000;
         let hash_b = (j * 2654435761) % 1000;
-        hash_a.cmp(&hash_b).then_with(|| a.source_path.cmp(&b.source_path))
+        hash_a
+            .cmp(&hash_b)
+            .then_with(|| a.source_path.cmp(&b.source_path))
     });
 
     let total_sessions = sessions.len();
@@ -275,13 +248,13 @@ pub fn write_jsonl_output(
 
     for (idx, (_, session)) in sessions.into_iter().enumerate() {
         let is_validation = idx >= train_count;
-        
+
         for conv in session.conversations {
             let mut messages = vec![MilesMessage {
                 role: Role::System,
                 content: system_prompt.to_string(),
             }];
-            
+
             messages.extend(conv.messages.iter().map(|m| MilesMessage {
                 role: m.role,
                 content: m.content.clone(),
@@ -289,7 +262,7 @@ pub fn write_jsonl_output(
 
             let record = MilesRecord { messages };
             let json_line = serde_json::to_string(&record)?;
-            
+
             if is_validation {
                 writeln!(val_file, "{}", json_line)?;
                 val_conversations += 1;
@@ -319,6 +292,8 @@ pub fn write_jsonl_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::ConversationMessage;
+    use crate::csv_adapter::{parse_csv_session, CsvRawEvent};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -340,7 +315,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let csv1 = temp.path().join("session1.csv");
         let csv2 = temp.path().join("subdir/session2.csv");
-        
+
         std::fs::create_dir_all(temp.path().join("subdir")).unwrap();
         std::fs::write(&csv1, "header\n").unwrap();
         std::fs::write(&csv2, "header\n").unwrap();
@@ -353,12 +328,28 @@ mod tests {
     fn test_process_session() {
         let temp = TempDir::new().unwrap();
         let csv_path = temp.path().join("test.csv");
-        
+
         let mut file = std::fs::File::create(&csv_path).unwrap();
-        writeln!(file, "Sequence,Time,File,RangeOffset,RangeLength,Text,Language,Type").unwrap();
-        writeln!(file, "1,2024-01-01,/test/file.rs,0,0,\"fn main() {{}}\",rust,tab").unwrap();
-        writeln!(file, "2,2024-01-01,/test/file.rs,0,0,echo hello,bash,terminal_command").unwrap();
-        writeln!(file, "3,2024-01-01,/test/file.rs,0,0,hello world,bash,terminal_output").unwrap();
+        writeln!(
+            file,
+            "Sequence,Time,File,RangeOffset,RangeLength,Text,Language,Type"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "1,2024-01-01,/test/file.rs,0,0,\"fn main() {{}}\",rust,tab"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "2,2024-01-01,/test/file.rs,0,0,echo hello,bash,terminal_command"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "3,2024-01-01,/test/file.rs,0,0,hello world,bash,terminal_output"
+        )
+        .unwrap();
 
         let config = PipelineConfig {
             min_conversation_messages: 2,
@@ -367,9 +358,116 @@ mod tests {
 
         let tokenizer = CharApproxTokenizer;
         let conversations = process_session(&csv_path, &tokenizer, &config).unwrap();
-        
+
         // Should have at least one conversation with messages
         assert!(!conversations.is_empty() || conversations.iter().any(|c| !c.messages.is_empty()));
     }
-}
 
+    fn process_session_legacy<T: Tokenizer>(
+        csv_path: &Path,
+        tokenizer: &T,
+        config: &PipelineConfig,
+    ) -> Result<Vec<FinalizedConversation>, Box<dyn std::error::Error>> {
+        let manager_config = ConversationStateManagerConfig {
+            viewport_radius: config.viewport_radius,
+            coalesce_radius: config.coalesce_radius,
+            max_tokens_per_message: config.max_tokens_per_message,
+            max_tokens_per_terminal_output: 256,
+            max_tokens_per_conversation: Some(config.max_tokens_per_conversation),
+            min_conversation_messages: config.min_conversation_messages,
+            system_prompt: config.system_prompt.clone(),
+            special_tokens_per_user_message: config.special_tokens_per_user_message,
+            special_tokens_per_assistant_message: config.special_tokens_per_assistant_message,
+            conversation_start_tokens: config.conversation_start_tokens,
+        };
+
+        let mut manager = ConversationStateManager::new(tokenizer, manager_config);
+        let raw_events = parse_csv_session(csv_path)?;
+
+        for event in raw_events {
+            match event {
+                CsvRawEvent::Tab {
+                    file_path,
+                    text_content,
+                } => manager.handle_tab_event(&file_path, text_content.as_deref()),
+                CsvRawEvent::Content {
+                    file_path,
+                    offset,
+                    length,
+                    new_text,
+                } => manager.handle_content_event(&file_path, offset, length, &new_text),
+                CsvRawEvent::Selection { file_path, offset } => {
+                    manager.handle_selection_event(&file_path, offset)
+                }
+                CsvRawEvent::TerminalCommand { command } => {
+                    manager.handle_terminal_command_event(&command)
+                }
+                CsvRawEvent::TerminalOutput { output } => {
+                    manager.handle_terminal_output_event(&output)
+                }
+                CsvRawEvent::TerminalFocus => manager.handle_terminal_focus_event(),
+                CsvRawEvent::GitBranchCheckout { branch_info } => {
+                    manager.handle_git_branch_checkout_event(&branch_info)
+                }
+            }
+        }
+
+        Ok(manager.get_conversations())
+    }
+
+    fn flatten_messages(convs: &[FinalizedConversation]) -> Vec<ConversationMessage> {
+        convs
+            .iter()
+            .flat_map(|c| c.messages.iter().cloned())
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn test_process_session_matches_legacy_behavior_for_sample_trace() {
+        let temp = TempDir::new().unwrap();
+        let csv_path = temp.path().join("parity.csv");
+
+        let mut file = std::fs::File::create(&csv_path).unwrap();
+        writeln!(
+            file,
+            "Sequence,Time,File,RangeOffset,RangeLength,Text,Language,Type"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "1,2024-01-01,/test/file.rs,0,0,\"fn main() {{\\n    let x = 1;\\n}}\",rust,tab"
+        )
+        .unwrap();
+        writeln!(file, "2,2024-01-01,/test/file.rs,22,1,2,rust,content").unwrap();
+        writeln!(file, "3,2024-01-01,/test/file.rs,22,0,3,rust,content").unwrap();
+        writeln!(
+            file,
+            "4,2024-01-01,/test/file.rs,0,0,cargo test,bash,terminal_command"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "5,2024-01-01,/test/file.rs,0,0,\"running tests\",bash,terminal_output"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "6,2024-01-01,/test/file.rs,10,0,,rust,selection_mouse"
+        )
+        .unwrap();
+
+        let config = PipelineConfig {
+            min_conversation_messages: 1,
+            max_tokens_per_conversation: 100_000,
+            ..Default::default()
+        };
+
+        let tokenizer = CharApproxTokenizer;
+        let legacy = process_session_legacy(&csv_path, &tokenizer, &config).unwrap();
+        let current = process_session(&csv_path, &tokenizer, &config).unwrap();
+
+        let legacy_messages = flatten_messages(&legacy);
+        let current_messages = flatten_messages(&current);
+        assert_eq!(legacy_messages, current_messages);
+    }
+}
