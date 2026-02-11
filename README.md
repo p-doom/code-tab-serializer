@@ -98,24 +98,45 @@ crowd-pilot-serialize \
 
 This uses shared CSV coalescing and converts each CSV transition into a Zeta training example.
 
+#### Sweep format (next edit)
+
+```bash
+crowd-pilot-serialize \
+    --output-format sweep \
+    --csv-root ./data/sessions \
+    --output-dir ./output-sweep \
+    --tokenizer "Qwen/Qwen2-7B" \
+    --chat-template qwen3 \
+    --sweep-viewport-lines 21 \
+    --sweep-opened-file-context full \
+    --sweep-history-center changed
+```
+
+This uses shared CSV coalescing and converts each CSV transition into a Sweep-style next-edit training example.
+Sweep applies a hard `--max-tokens-per-conversation` budget by trimming oldest history first; if even zero-history context does not fit, the sample is dropped.
+
 #### CLI Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--output-format` | `sed` | Output format: `sed` or `zeta` |
+| `--output-format` | `sed` | Output format: `sed`, `zeta`, or `sweep` |
 | `--csv-root` | required | Root directory containing per-session CSV files |
 | `--output-dir` | required | Output directory for JSONL files |
 | `--tokenizer` | required | HuggingFace tokenizer name or path |
 | `--chat-template` | required | Chat template: `qwen3` or `glm45` |
-| `--max-tokens-per-conversation` | 8192 | Maximum tokens per conversation chunk (SED only) |
+| `--max-tokens-per-conversation` | 8192 | Maximum tokens per conversation chunk (SED/Sweep) |
 | `--max-tokens-per-message` | 2048 | Maximum tokens per message (SED only) |
 | `--min-conversation-messages` | 5 | Minimum messages to keep a conversation (SED only) |
 | `--viewport-radius` | 10 | Lines above/below cursor to show (SED only) |
+| `--system-prompt` | format default | Custom system prompt (SED/Sweep only) |
 | `--coalesce-radius` | 5 | Radius for grouping nearby edits |
 | `--val-ratio` | 0.10 | Fraction of sessions for validation |
 | `--zeta-max-editable-tokens` | 180 | Editable-region token budget (Zeta only) |
 | `--zeta-max-context-tokens` | 350 | Context-region token budget (Zeta only) |
 | `--zeta-diff-context-lines` | 3 | Unified-diff context lines (Zeta only) |
+| `--sweep-viewport-lines` | 21 | Fixed viewport lines for target/history windows (Sweep only) |
+| `--sweep-opened-file-context` | `full` | Opened-file context mode: `full` or `viewport` (Sweep only) |
+| `--sweep-history-center` | `changed` | History viewport centering: `changed` or `cursor` (Sweep only) |
 
 ### CLI (Replay crowd-code 2.0)
 

@@ -3,6 +3,7 @@
 //! This tool processes CSV session files and outputs JSONL format for:
 //! - SED command-prediction training
 //! - Zeta edit-prediction training
+//! - Sweep next-edit training
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,9 +12,11 @@ use clap::{Parser, ValueEnum};
 use tokenizers::Tokenizer as HfTokenizer;
 
 use crowd_pilot_serializer_core::{
-    convert_csv_to_zeta_session, default_system_prompt, discover_csv_files,
+    convert_csv_to_sweep_session, convert_csv_to_zeta_session, default_system_prompt,
+    discover_csv_files,
     pipeline::{MilesMessage, MilesRecord, PipelineConfig, PipelineResult},
-    process_all_sessions, write_jsonl_output, Tokenizer, ZetaConfig, ZetaConversation,
+    process_all_sessions, sweep_system_prompt, write_jsonl_output, SweepConfig, SweepConversation,
+    SweepHistoryCenterMode, SweepOpenedFileContextMode, Tokenizer, ZetaConfig, ZetaConversation,
 };
 
 /// Special token counts for known chat templates: (user/system, assistant, conversation_start)
@@ -33,6 +36,19 @@ fn chat_template_overhead(name: &str) -> Option<(usize, usize, usize)> {
 enum OutputFormat {
     Sed,
     Zeta,
+    Sweep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SweepOpenedFileContextArg {
+    Full,
+    Viewport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SweepHistoryCenterArg {
+    Changed,
+    Cursor,
 }
 
 /// Serialize crowd-pilot CSV sessions to JSONL format.
@@ -61,7 +77,7 @@ struct Args {
     #[arg(long)]
     chat_template: Option<String>,
 
-    /// Maximum tokens per conversation chunk (SED only)
+    /// Maximum tokens per conversation chunk (SED/Sweep)
     #[arg(long, default_value = "8192")]
     max_tokens_per_conversation: usize,
 
@@ -85,7 +101,7 @@ struct Args {
     #[arg(long, default_value = "0.1")]
     val_ratio: f64,
 
-    /// Custom system prompt (SED only)
+    /// Custom system prompt (SED/Sweep only)
     #[arg(long)]
     system_prompt: Option<String>,
 
@@ -100,6 +116,18 @@ struct Args {
     /// Zeta unified diff context lines
     #[arg(long, default_value = "3")]
     zeta_diff_context_lines: usize,
+
+    /// Sweep fixed viewport lines
+    #[arg(long, default_value = "21")]
+    sweep_viewport_lines: usize,
+
+    /// Sweep opened-file context mode
+    #[arg(long, value_enum, default_value_t = SweepOpenedFileContextArg::Full)]
+    sweep_opened_file_context: SweepOpenedFileContextArg,
+
+    /// Sweep history window centering mode
+    #[arg(long, value_enum, default_value_t = SweepHistoryCenterArg::Changed)]
+    sweep_history_center: SweepHistoryCenterArg,
 }
 
 /// Wrapper around HuggingFace tokenizers for token counting and truncation.
@@ -153,8 +181,85 @@ struct ZetaSessionResult {
     source_path: String,
 }
 
+#[derive(Debug)]
+struct SweepSessionResult {
+    conversations: Vec<SweepConversation>,
+    source_path: String,
+}
+
 fn write_zeta_jsonl_output(
     session_results: Vec<ZetaSessionResult>,
+    output_dir: &Path,
+    val_ratio: f64,
+) -> Result<PipelineResult, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let mut sessions: Vec<_> = session_results.into_iter().enumerate().collect();
+    sessions.sort_by(|(i, a), (j, b)| {
+        let hash_a = (i * 2654435761) % 1000;
+        let hash_b = (j * 2654435761) % 1000;
+        hash_a
+            .cmp(&hash_b)
+            .then_with(|| a.source_path.cmp(&b.source_path))
+    });
+
+    let total_sessions = sessions.len();
+    let val_count = (total_sessions as f64 * val_ratio).round() as usize;
+    let train_count = total_sessions.saturating_sub(val_count);
+
+    let train_path = output_dir.join("training.jsonl");
+    let val_path = output_dir.join("validation.jsonl");
+
+    let mut train_file = BufWriter::new(std::fs::File::create(&train_path)?);
+    let mut val_file = BufWriter::new(std::fs::File::create(&val_path)?);
+
+    let mut train_conversations = 0;
+    let mut val_conversations = 0;
+    let mut total_messages = 0;
+    let mut total_tokens = 0;
+
+    for (idx, (_, session)) in sessions.into_iter().enumerate() {
+        let is_validation = idx >= train_count;
+        for conv in session.conversations {
+            let messages = conv
+                .messages
+                .iter()
+                .map(|m| MilesMessage {
+                    role: m.role,
+                    content: m.content.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            let record = MilesRecord { messages };
+            let json_line = serde_json::to_string(&record)?;
+            if is_validation {
+                writeln!(val_file, "{}", json_line)?;
+                val_conversations += 1;
+            } else {
+                writeln!(train_file, "{}", json_line)?;
+                train_conversations += 1;
+            }
+
+            total_messages += conv.messages.len();
+            total_tokens += conv.token_count;
+        }
+    }
+
+    train_file.flush()?;
+    val_file.flush()?;
+
+    Ok(PipelineResult {
+        total_sessions,
+        total_conversations: train_conversations + val_conversations,
+        train_conversations,
+        val_conversations,
+        total_messages,
+        total_tokens,
+    })
+}
+
+fn write_sweep_jsonl_output(
+    session_results: Vec<SweepSessionResult>,
     output_dir: &Path,
     val_ratio: f64,
 ) -> Result<PipelineResult, Box<dyn std::error::Error>> {
@@ -359,16 +464,19 @@ fn run_zeta(
     let mut session_results = Vec::with_capacity(total_files);
     let mut error_count = 0usize;
     for (idx, csv_path) in csv_files.into_iter().enumerate() {
-        let conversations =
-            match convert_csv_to_zeta_session(&csv_path, tokenizer, args.coalesce_radius, &zeta_config)
-            {
-                Ok(conversations) => conversations,
-                Err(e) => {
-                    error_count += 1;
-                    eprintln!("Warning: Error processing {:?}: {}", csv_path, e);
-                    continue;
-                }
-            };
+        let conversations = match convert_csv_to_zeta_session(
+            &csv_path,
+            tokenizer,
+            args.coalesce_radius,
+            &zeta_config,
+        ) {
+            Ok(conversations) => conversations,
+            Err(e) => {
+                error_count += 1;
+                eprintln!("Warning: Error processing {:?}: {}", csv_path, e);
+                continue;
+            }
+        };
 
         if (idx + 1) % 100 == 0 || idx + 1 == total_files {
             eprintln!("Processed {}/{} sessions...", idx + 1, total_files);
@@ -402,6 +510,133 @@ fn run_zeta(
             "zeta_max_editable_tokens": args.zeta_max_editable_tokens,
             "zeta_max_context_tokens": args.zeta_max_context_tokens,
             "zeta_diff_context_lines": args.zeta_diff_context_lines,
+        },
+    });
+
+    Ok((result, metadata))
+}
+
+fn run_sweep(
+    args: &Args,
+    tokenizer: &RustTokenizer,
+) -> Result<(PipelineResult, serde_json::Value), Box<dyn std::error::Error>> {
+    let chat_template = args
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| "--chat-template is required when --output-format sweep".to_string())?;
+
+    let (special_tokens_per_user, special_tokens_per_assistant, conversation_start_tokens) =
+        chat_template_overhead(chat_template).ok_or_else(|| {
+            format!(
+                "Unknown chat template: '{}'. Supported: qwen3, glm45",
+                chat_template
+            )
+        })?;
+
+    println!("  Chat template: {}", chat_template);
+    println!(
+        "  Per user/system message overhead: {} tokens",
+        special_tokens_per_user
+    );
+    println!(
+        "  Per assistant message overhead: {} tokens",
+        special_tokens_per_assistant
+    );
+    println!(
+        "  Conversation start overhead: {} tokens",
+        conversation_start_tokens
+    );
+
+    let opened_file_context_mode = match args.sweep_opened_file_context {
+        SweepOpenedFileContextArg::Full => SweepOpenedFileContextMode::Full,
+        SweepOpenedFileContextArg::Viewport => SweepOpenedFileContextMode::Viewport,
+    };
+    let history_center_mode = match args.sweep_history_center {
+        SweepHistoryCenterArg::Changed => SweepHistoryCenterMode::ChangedBlock,
+        SweepHistoryCenterArg::Cursor => SweepHistoryCenterMode::Cursor,
+    };
+
+    let default_prompt = sweep_system_prompt();
+    let system_prompt = args
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| default_prompt.clone());
+
+    let sweep_config = SweepConfig {
+        viewport_lines: args.sweep_viewport_lines,
+        opened_file_context_mode,
+        history_center_mode,
+        max_tokens_per_conversation: Some(args.max_tokens_per_conversation),
+        system_prompt: system_prompt.clone(),
+        special_tokens_per_user_message: special_tokens_per_user,
+        special_tokens_per_assistant_message: special_tokens_per_assistant,
+        conversation_start_tokens,
+    };
+
+    println!("Processing CSV files from {:?}...", args.csv_root);
+    let csv_files = discover_csv_files(&args.csv_root);
+    if csv_files.is_empty() {
+        return Err(format!("No CSV files found under {:?}", args.csv_root).into());
+    }
+
+    let total_files = csv_files.len();
+    let mut session_results = Vec::with_capacity(total_files);
+    let mut error_count = 0usize;
+    for (idx, csv_path) in csv_files.into_iter().enumerate() {
+        let conversations = match convert_csv_to_sweep_session(
+            &csv_path,
+            tokenizer,
+            args.coalesce_radius,
+            &sweep_config,
+        ) {
+            Ok(conversations) => conversations,
+            Err(e) => {
+                error_count += 1;
+                eprintln!("Warning: Error processing {:?}: {}", csv_path, e);
+                continue;
+            }
+        };
+
+        if (idx + 1) % 100 == 0 || idx + 1 == total_files {
+            eprintln!("Processed {}/{} sessions...", idx + 1, total_files);
+        }
+
+        session_results.push(SweepSessionResult {
+            conversations,
+            source_path: csv_path.to_string_lossy().to_string(),
+        });
+    }
+
+    if error_count > 0 {
+        eprintln!("Warning: {} sessions failed to process", error_count);
+    }
+
+    println!("Writing output to {:?}...", args.output_dir);
+    let result = write_sweep_jsonl_output(session_results, &args.output_dir, args.val_ratio)?;
+
+    let metadata = serde_json::json!({
+        "mode": "sweep",
+        "config": {
+            "csv_root": args.csv_root.to_string_lossy(),
+            "output_dir": args.output_dir.to_string_lossy(),
+            "tokenizer": args.tokenizer,
+            "chat_template": chat_template,
+            "system_prompt": system_prompt,
+            "special_tokens_per_user_message": special_tokens_per_user,
+            "special_tokens_per_assistant_message": special_tokens_per_assistant,
+            "conversation_start_tokens": conversation_start_tokens,
+            "max_tokens_per_conversation": args.max_tokens_per_conversation,
+            "coalesce_radius": args.coalesce_radius,
+            "val_ratio": args.val_ratio,
+            "sweep_viewport_lines": args.sweep_viewport_lines,
+            "sweep_opened_file_context": match args.sweep_opened_file_context {
+                SweepOpenedFileContextArg::Full => "full",
+                SweepOpenedFileContextArg::Viewport => "viewport",
+            },
+            "sweep_history_center": match args.sweep_history_center {
+                SweepHistoryCenterArg::Changed => "changed",
+                SweepHistoryCenterArg::Cursor => "cursor",
+            },
         },
     });
 
@@ -466,6 +701,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (result, metadata_extra) = match args.output_format {
         OutputFormat::Sed => run_sed(&args, &tokenizer)?,
         OutputFormat::Zeta => run_zeta(&args, &tokenizer)?,
+        OutputFormat::Sweep => run_sweep(&args, &tokenizer)?,
     };
 
     let metadata_path = write_metadata(&args, &result, metadata_extra)?;
