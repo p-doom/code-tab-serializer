@@ -366,9 +366,6 @@ fn run_zeta(
                 Err(e) => {
                     error_count += 1;
                     eprintln!("Warning: Error processing {:?}: {}", csv_path, e);
-                    if (idx + 1) % 100 == 0 || idx + 1 == total_files {
-                        eprintln!("Processed {}/{} sessions...", idx + 1, total_files);
-                    }
                     continue;
                 }
             };
