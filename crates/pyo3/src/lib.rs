@@ -177,20 +177,13 @@ fn default_system_prompt(viewport_radius: usize) -> String {
     core_default_system_prompt(viewport_radius)
 }
 
-fn zeta_message_to_dict(py: Python<'_>, msg: &ConversationMessage) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("role", role_to_str(msg.role))?;
-    dict.set_item("content", &msg.content)?;
-    Ok(dict.into())
-}
-
 fn zeta_conversation_to_dict(py: Python<'_>, conv: &ZetaConversation) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
 
     let messages: Vec<Py<PyDict>> = conv
         .messages
         .iter()
-        .map(|m| zeta_message_to_dict(py, m))
+        .map(|m| message_to_dict(py, m))
         .collect::<PyResult<_>>()?;
 
     dict.set_item("messages", PyList::new(py, messages)?)?;
@@ -211,7 +204,7 @@ fn sweep_conversation_to_dict(py: Python<'_>, conv: &SweepConversation) -> PyRes
     let messages: Vec<Py<PyDict>> = conv
         .messages
         .iter()
-        .map(|m| zeta_message_to_dict(py, m))
+        .map(|m| message_to_dict(py, m))
         .collect::<PyResult<_>>()?;
 
     dict.set_item("messages", PyList::new(py, messages)?)?;
@@ -257,9 +250,9 @@ fn zeta_system_prompt() -> String {
 /// Args:
 ///     yaml_content: The YAML file content as a string.
 ///     viewport_lines: Fixed window size for target/history viewports (default: 21).
-///     opened_file_context: Context strategy for opened files: `\"full\"` or `\"viewport\"`.
-///     history_center: History window centering mode: `\"changed\"` or `\"cursor\"`.
+///     opened_file_context: Context strategy for opened files: `"full"` or `"viewport"`.
 ///     system_prompt: Optional custom system prompt. Defaults to Sweep prompt when None.
+///     history_center: History window centering mode: `"changed"` or `"cursor"`.
 ///     max_tokens_per_conversation: Optional hard max token budget for a sample.
 ///         History is trimmed first to fit; sample is dropped if zero-history still does not fit.
 ///
