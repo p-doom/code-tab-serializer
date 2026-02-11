@@ -6,13 +6,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crowd_pilot_serializer_core::{
-    convert_yaml_to_conversations as core_convert,
-    convert_yaml_to_zeta as core_convert_zeta,
-    default_system_prompt as core_default_system_prompt,
-    parse_yaml_task as core_parse_yaml,
-    zeta_system_prompt as core_zeta_system_prompt,
-    ConversationMessage, FinalizedConversation, Role, Tokenizer,
-    YamlProcessingConfig, ZetaConfig, ZetaConversation,
+    convert_yaml_to_conversations as core_convert, convert_yaml_to_sweep as core_convert_sweep,
+    convert_yaml_to_zeta as core_convert_zeta, default_system_prompt as core_default_system_prompt,
+    parse_yaml_task as core_parse_yaml, sweep_system_prompt as core_sweep_system_prompt,
+    zeta_system_prompt as core_zeta_system_prompt, ConversationMessage, FinalizedConversation,
+    Role, SweepConfig, SweepConversation, SweepHistoryCenterMode, SweepOpenedFileContextMode,
+    Tokenizer, YamlProcessingConfig, ZetaConfig, ZetaConversation,
 };
 
 /// Character-based approximate tokenizer (~4 chars per token).
@@ -45,16 +44,16 @@ fn message_to_dict(py: Python<'_>, msg: &ConversationMessage) -> PyResult<Py<PyD
 
 fn conversation_to_dict(py: Python<'_>, conv: &FinalizedConversation) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
-    
+
     let messages: Vec<Py<PyDict>> = conv
         .messages
         .iter()
         .map(|m| message_to_dict(py, m))
         .collect::<PyResult<_>>()?;
-    
+
     dict.set_item("messages", PyList::new(py, messages)?)?;
     dict.set_item("token_count", conv.token_count)?;
-    
+
     Ok(dict.into())
 }
 
@@ -103,11 +102,11 @@ fn parse_yaml_task(py: Python<'_>, yaml_content: String) -> PyResult<Py<PyDict>>
 
     let dict = PyDict::new(py);
     dict.set_item("task_id", &task.task_id)?;
-    
+
     if let Some(desc) = &task.description {
         dict.set_item("description", desc)?;
     }
-    
+
     // Convert states to list of dicts
     let states: Vec<Py<PyDict>> = task
         .states
@@ -155,13 +154,13 @@ fn parse_yaml_task(py: Python<'_>, yaml_content: String) -> PyResult<Py<PyDict>>
             Ok(state_dict.into())
         })
         .collect::<PyResult<_>>()?;
-    
+
     dict.set_item("states", PyList::new(py, states)?)?;
-    
+
     if let Some(labels) = &task.labels {
         dict.set_item("labels", labels)?;
     }
-    
+
     Ok(dict.into())
 }
 
@@ -187,22 +186,37 @@ fn zeta_message_to_dict(py: Python<'_>, msg: &ConversationMessage) -> PyResult<P
 
 fn zeta_conversation_to_dict(py: Python<'_>, conv: &ZetaConversation) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
-    
+
     let messages: Vec<Py<PyDict>> = conv
         .messages
         .iter()
         .map(|m| zeta_message_to_dict(py, m))
         .collect::<PyResult<_>>()?;
-    
+
     dict.set_item("messages", PyList::new(py, messages)?)?;
     dict.set_item("token_count", conv.token_count)?;
-    
+
     // Add editable range info
     let range_dict = PyDict::new(py);
     range_dict.set_item("start", conv.editable_range.start)?;
     range_dict.set_item("end", conv.editable_range.end)?;
     dict.set_item("editable_range", range_dict)?;
-    
+
+    Ok(dict.into())
+}
+
+fn sweep_conversation_to_dict(py: Python<'_>, conv: &SweepConversation) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+
+    let messages: Vec<Py<PyDict>> = conv
+        .messages
+        .iter()
+        .map(|m| zeta_message_to_dict(py, m))
+        .collect::<PyResult<_>>()?;
+
+    dict.set_item("messages", PyList::new(py, messages)?)?;
+    dict.set_item("token_count", conv.token_count)?;
+    dict.set_item("target_file", &conv.target_file)?;
     Ok(dict.into())
 }
 
@@ -238,13 +252,88 @@ fn zeta_system_prompt() -> String {
     core_zeta_system_prompt()
 }
 
+/// Convert YAML content to Sweep-format conversations.
+///
+/// Args:
+///     yaml_content: The YAML file content as a string.
+///     viewport_lines: Fixed window size for target/history viewports (default: 21).
+///     opened_file_context: Context strategy for opened files: `\"full\"` or `\"viewport\"`.
+///     history_center: History window centering mode: `\"changed\"` or `\"cursor\"`.
+///     system_prompt: Optional custom system prompt. Defaults to Sweep prompt when None.
+///     max_tokens_per_conversation: Optional hard max token budget for a sample.
+///         History is trimmed first to fit; sample is dropped if zero-history still does not fit.
+///
+/// Returns:
+///     List of Sweep conversation dictionaries with:
+///     - messages: List of {role, content} dicts
+///     - token_count: Approximate token count
+///     - target_file: Target file path
+#[pyfunction]
+#[pyo3(signature = (yaml_content, viewport_lines=21, opened_file_context="full".to_string(), system_prompt=None, history_center="changed".to_string(), max_tokens_per_conversation=None))]
+fn convert_yaml_to_sweep(
+    py: Python<'_>,
+    yaml_content: String,
+    viewport_lines: usize,
+    opened_file_context: String,
+    system_prompt: Option<String>,
+    history_center: String,
+    max_tokens_per_conversation: Option<usize>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let opened_mode = match opened_file_context.to_lowercase().as_str() {
+        "full" => SweepOpenedFileContextMode::Full,
+        "viewport" => SweepOpenedFileContextMode::Viewport,
+        other => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid opened_file_context '{}'. Supported: full, viewport",
+                other
+            )));
+        }
+    };
+
+    let history_center_mode = match history_center.to_lowercase().as_str() {
+        "changed" => SweepHistoryCenterMode::ChangedBlock,
+        "cursor" => SweepHistoryCenterMode::Cursor,
+        other => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid history_center '{}'. Supported: changed, cursor",
+                other
+            )));
+        }
+    };
+
+    let config = SweepConfig {
+        viewport_lines,
+        opened_file_context_mode: opened_mode,
+        history_center_mode,
+        max_tokens_per_conversation,
+        system_prompt: system_prompt.unwrap_or_else(core_sweep_system_prompt),
+        ..SweepConfig::default()
+    };
+
+    let conversations = core_convert_sweep(&yaml_content, &CharApproxTokenizer, &config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+
+    conversations
+        .iter()
+        .map(|c| sweep_conversation_to_dict(py, c))
+        .collect()
+}
+
+/// Get the Sweep-format default system prompt.
+#[pyfunction]
+fn sweep_system_prompt() -> String {
+    core_sweep_system_prompt()
+}
+
 /// Python module for crowd-pilot serializer.
 #[pymodule]
 fn crowd_pilot_serializer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert_yaml_to_conversations, m)?)?;
     m.add_function(wrap_pyfunction!(convert_yaml_to_zeta, m)?)?;
+    m.add_function(wrap_pyfunction!(convert_yaml_to_sweep, m)?)?;
     m.add_function(wrap_pyfunction!(parse_yaml_task, m)?)?;
     m.add_function(wrap_pyfunction!(default_system_prompt, m)?)?;
     m.add_function(wrap_pyfunction!(zeta_system_prompt, m)?)?;
+    m.add_function(wrap_pyfunction!(sweep_system_prompt, m)?)?;
     Ok(())
 }
