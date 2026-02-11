@@ -357,10 +357,21 @@ fn run_zeta(
 
     let total_files = csv_files.len();
     let mut session_results = Vec::with_capacity(total_files);
+    let mut error_count = 0usize;
     for (idx, csv_path) in csv_files.into_iter().enumerate() {
         let conversations =
-            convert_csv_to_zeta_session(&csv_path, tokenizer, args.coalesce_radius, &zeta_config)
-                .map_err(|e| format!("Error processing {:?}: {}", csv_path, e))?;
+            match convert_csv_to_zeta_session(&csv_path, tokenizer, args.coalesce_radius, &zeta_config)
+            {
+                Ok(conversations) => conversations,
+                Err(e) => {
+                    error_count += 1;
+                    eprintln!("Warning: Error processing {:?}: {}", csv_path, e);
+                    if (idx + 1) % 100 == 0 || idx + 1 == total_files {
+                        eprintln!("Processed {}/{} sessions...", idx + 1, total_files);
+                    }
+                    continue;
+                }
+            };
 
         if (idx + 1) % 100 == 0 || idx + 1 == total_files {
             eprintln!("Processed {}/{} sessions...", idx + 1, total_files);
@@ -370,6 +381,10 @@ fn run_zeta(
             conversations,
             source_path: csv_path.to_string_lossy().to_string(),
         });
+    }
+
+    if error_count > 0 {
+        eprintln!("Warning: {} sessions failed to process", error_count);
     }
 
     println!("Writing output to {:?}...", args.output_dir);
