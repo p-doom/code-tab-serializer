@@ -4,14 +4,18 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::sync::Mutex;
 
 use crowd_pilot_serializer_core::{
     convert_yaml_to_conversations as core_convert, convert_yaml_to_sweep as core_convert_sweep,
     convert_yaml_to_zeta as core_convert_zeta, default_system_prompt as core_default_system_prompt,
     parse_yaml_task as core_parse_yaml, sweep_system_prompt as core_sweep_system_prompt,
     zeta_system_prompt as core_zeta_system_prompt, ConversationMessage, FinalizedConversation,
-    Role, SweepConfig, SweepConversation, SweepHistoryCenterMode, SweepOpenedFileContextMode,
-    Tokenizer, YamlProcessingConfig, ZetaConfig, ZetaConversation,
+    Role, SweepConfig, SweepConversation,
+    SweepConversationStateManager as CoreSweepConversationStateManager,
+    SweepConversationStateManagerConfig, SweepHistoryCenterMode, SweepModelEdit,
+    SweepModelEditKind, SweepOpenedFileContextMode, Tokenizer, YamlProcessingConfig, ZetaConfig,
+    ZetaConversation,
 };
 
 /// Character-based approximate tokenizer (~4 chars per token).
@@ -213,6 +217,51 @@ fn sweep_conversation_to_dict(py: Python<'_>, conv: &SweepConversation) -> PyRes
     Ok(dict.into())
 }
 
+fn parse_opened_file_context_mode(mode: &str) -> PyResult<SweepOpenedFileContextMode> {
+    match mode.to_lowercase().as_str() {
+        "full" => Ok(SweepOpenedFileContextMode::Full),
+        "viewport" => Ok(SweepOpenedFileContextMode::Viewport),
+        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid opened_file_context '{}'. Supported: full, viewport",
+            other
+        ))),
+    }
+}
+
+fn parse_history_center_mode(mode: &str) -> PyResult<SweepHistoryCenterMode> {
+    match mode.to_lowercase().as_str() {
+        "changed" => Ok(SweepHistoryCenterMode::ChangedBlock),
+        "cursor" => Ok(SweepHistoryCenterMode::Cursor),
+        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid history_center '{}'. Supported: changed, cursor",
+            other
+        ))),
+    }
+}
+
+fn sweep_model_edit_to_dict(py: Python<'_>, edit: &SweepModelEdit) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("target_file", &edit.target_file)?;
+    let kind = match edit.kind {
+        SweepModelEditKind::Insert => "insert",
+        SweepModelEditKind::Delete => "delete",
+        SweepModelEditKind::Replace => "replace",
+    };
+    dict.set_item("kind", kind)?;
+    dict.set_item("start_line", edit.start_line)?;
+    if let Some(end_line) = edit.end_line {
+        dict.set_item("end_line", end_line)?;
+    } else {
+        dict.set_item("end_line", py.None())?;
+    }
+    if let Some(text) = &edit.text {
+        dict.set_item("text", text)?;
+    } else {
+        dict.set_item("text", py.None())?;
+    }
+    Ok(dict.into())
+}
+
 /// Convert YAML content to Zeta-format conversations.
 ///
 /// Args:
@@ -272,27 +321,8 @@ fn convert_yaml_to_sweep(
     history_center: String,
     max_tokens_per_conversation: Option<usize>,
 ) -> PyResult<Vec<Py<PyDict>>> {
-    let opened_mode = match opened_file_context.to_lowercase().as_str() {
-        "full" => SweepOpenedFileContextMode::Full,
-        "viewport" => SweepOpenedFileContextMode::Viewport,
-        other => {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Invalid opened_file_context '{}'. Supported: full, viewport",
-                other
-            )));
-        }
-    };
-
-    let history_center_mode = match history_center.to_lowercase().as_str() {
-        "changed" => SweepHistoryCenterMode::ChangedBlock,
-        "cursor" => SweepHistoryCenterMode::Cursor,
-        other => {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Invalid history_center '{}'. Supported: changed, cursor",
-                other
-            )));
-        }
-    };
+    let opened_mode = parse_opened_file_context_mode(&opened_file_context)?;
+    let history_center_mode = parse_history_center_mode(&history_center)?;
 
     let config = SweepConfig {
         viewport_lines,
@@ -318,6 +348,170 @@ fn sweep_system_prompt() -> String {
     core_sweep_system_prompt()
 }
 
+/// Runtime Sweep conversation manager.
+#[pyclass]
+struct SweepConversationStateManager {
+    inner: Mutex<CoreSweepConversationStateManager<CharApproxTokenizer>>,
+}
+
+#[pymethods]
+impl SweepConversationStateManager {
+    #[new]
+    #[pyo3(signature = (viewport_lines=21, opened_file_context="full".to_string(), history_center="changed".to_string(), coalesce_radius=5, max_history_entries=64, system_prompt=None))]
+    fn new(
+        viewport_lines: usize,
+        opened_file_context: String,
+        history_center: String,
+        coalesce_radius: usize,
+        max_history_entries: usize,
+        system_prompt: Option<String>,
+    ) -> PyResult<Self> {
+        let opened_mode = parse_opened_file_context_mode(&opened_file_context)?;
+        let history_mode = parse_history_center_mode(&history_center)?;
+
+        let mut config = SweepConversationStateManagerConfig::default();
+        config.viewport_lines = viewport_lines;
+        config.opened_file_context_mode = opened_mode;
+        config.history_center_mode = history_mode;
+        config.coalesce_radius = coalesce_radius;
+        config.max_history_entries = max_history_entries;
+        if let Some(prompt) = system_prompt {
+            config.system_prompt = prompt;
+        }
+
+        Ok(Self {
+            inner: Mutex::new(CoreSweepConversationStateManager::new(
+                CharApproxTokenizer,
+                config,
+            )),
+        })
+    }
+
+    fn reset(&self) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.reset();
+        Ok(())
+    }
+
+    fn get_file_content(&self, file_path: String) -> PyResult<String> {
+        let inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        Ok(inner.get_file_content(&file_path))
+    }
+
+    #[pyo3(signature = (file_path, text_content=None))]
+    fn handle_tab_event(&self, file_path: String, text_content: Option<String>) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_tab_event(&file_path, text_content.as_deref());
+        Ok(())
+    }
+
+    fn handle_content_event(
+        &self,
+        file_path: String,
+        offset: usize,
+        length: usize,
+        new_text: String,
+    ) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_content_event(&file_path, offset, length, &new_text);
+        Ok(())
+    }
+
+    fn handle_selection_event(&self, file_path: String, offset: usize) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_selection_event(&file_path, offset);
+        Ok(())
+    }
+
+    fn handle_cursor_by_line(&self, file_path: String, line: usize) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_cursor_by_line(&file_path, line);
+        Ok(())
+    }
+
+    fn handle_terminal_command_event(&self, command: String) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_terminal_command_event(&command);
+        Ok(())
+    }
+
+    fn handle_terminal_output_event(&self, output: String) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_terminal_output_event(&output);
+        Ok(())
+    }
+
+    fn handle_terminal_focus_event(&self) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_terminal_focus_event();
+        Ok(())
+    }
+
+    fn handle_git_branch_checkout_event(&self, branch_info: String) -> PyResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        inner.handle_git_branch_checkout_event(&branch_info);
+        Ok(())
+    }
+
+    fn finalize_for_model(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        let prompt = inner.finalize_for_model();
+
+        let dict = PyDict::new(py);
+        let messages: Vec<Py<PyDict>> = prompt
+            .messages
+            .iter()
+            .map(|m| message_to_dict(py, m))
+            .collect::<PyResult<_>>()?;
+        dict.set_item("messages", PyList::new(py, messages)?)?;
+        dict.set_item("token_count", prompt.token_count)?;
+        dict.set_item("target_file", prompt.target_file)?;
+        dict.set_item("window_start_line", prompt.window_start_line)?;
+        dict.set_item("window_end_line", prompt.window_end_line)?;
+        dict.set_item("current_window", prompt.current_window)?;
+        Ok(dict.into())
+    }
+
+    fn parse_model_response(
+        &self,
+        py: Python<'_>,
+        response: String,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        let inner = self.inner.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned")
+        })?;
+        let parsed = inner
+            .parse_model_response(&response)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+        match parsed {
+            Some(edit) => Ok(Some(sweep_model_edit_to_dict(py, &edit)?)),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Python module for crowd-pilot serializer.
 #[pymodule]
 fn crowd_pilot_serializer(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -328,5 +522,6 @@ fn crowd_pilot_serializer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_system_prompt, m)?)?;
     m.add_function(wrap_pyfunction!(zeta_system_prompt, m)?)?;
     m.add_function(wrap_pyfunction!(sweep_system_prompt, m)?)?;
+    m.add_class::<SweepConversationStateManager>()?;
     Ok(())
 }
