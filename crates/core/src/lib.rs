@@ -35,6 +35,7 @@ mod diff;
 mod helpers;
 pub mod pipeline;
 pub mod sweep_format;
+pub mod sweep_runtime;
 pub mod yaml_adapter;
 pub mod zeta_format;
 
@@ -59,6 +60,10 @@ pub use sweep_format::{
     convert_csv_to_sweep_session, convert_yaml_to_sweep, process_task_sweep,
     process_yaml_task_sweep, sweep_system_prompt, SweepConfig, SweepConversation,
     SweepHistoryCenterMode, SweepOpenedFileContextMode, SweepSamplingMode,
+};
+pub use sweep_runtime::{
+    SweepConversationStateManager, SweepConversationStateManagerConfig, SweepModelEdit,
+    SweepModelEditKind, SweepRuntimePrompt,
 };
 pub use yaml_adapter::{
     convert_yaml_to_conversations, find_changed_files, has_terminal_command, is_eval_state,
