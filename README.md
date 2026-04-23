@@ -1,6 +1,6 @@
-# crowd-pilot-serializer
+# code-tab-serializer
 
-Core serialization library for crowd-pilot's IDE interaction data. Converts IDE events (tab switches, edits, terminal commands, etc.) into conversation format for training language models.
+Core serialization library for code-tab's IDE interaction data. Converts IDE events (tab switches, edits, terminal commands, etc.) into conversation format for training language models.
 
 ## Architecture
 
